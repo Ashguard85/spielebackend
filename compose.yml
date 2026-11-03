@@ -1,0 +1,17 @@
+services:
+  spiele-zentrale:
+    build:
+      context: .
+    container_name: spiele-zentrale
+    restart: unless-stopped
+    ports:
+      - "8096:8080"
+    volumes:
+      - /opt/docker/spiele-zentrale/data:/app/data
+    environment:
+      DATA_DIR: /app/data
+      AUTH_ENABLED: "true"
+      APP_API_TOKEN: "${APP_API_TOKEN:?Set a random secret of at least 32 characters}"
+      PWA_ALLOWED_ORIGIN: "${PWA_ALLOWED_ORIGIN:-}"
+      BACKUP_KEEP: "50"
+      MAX_APP_DOC_BYTES: "${MAX_APP_DOC_BYTES:-3000000}"

@@ -1,334 +1,207 @@
-"""Spiele-Zentrale v2: generic SQLite game API + local static game hosting.
-
-Important: app data remains keyed under its old app_id. ZIPs only contain static sites.
-"""
-from __future__ import annotations
-import os, json, re, hmac, tempfile, zipfile, sqlite3, traceback, uuid
+"""Spiele-Zentrale v1: generic versioned JSON documents; no game rules on server."""
+import hmac, json, os, re, sqlite3, sys, threading, tempfile, zipfile, io
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
-from datetime import datetime, timezone
+from flask import Flask, request, jsonify, Response
 
-from flask import Flask, request, jsonify, Response, redirect, send_file, send_from_directory, abort
-from games_platform.store import (VALID_ID, init, connect, transaction, get_doc, set_doc, remove_doc,
-                            registry, state_allowed, list_apps, set_registry, audit, full_backup,
-                            db_path, all_docs, utc, all_players, add_player)
-from games_platform.packages import app_folder, install, remove_frontend, manifest, apps_root, backup_frontend, validated_files
+VERSION='v1.1'; SCHEMA=1
+ROOT=Path(os.getenv('DATA_DIR','/app/data')); DB=ROOT/'spiele.sqlite'; BACKUPS=ROOT/'backups'
+ORIGINS={s.strip().rstrip('/') for s in os.getenv('PWA_ALLOWED_ORIGIN','').split(',') if s.strip()}
+API_TOKEN=os.getenv('APP_API_TOKEN',''); AUTH=os.getenv('AUTH_ENABLED','true').lower() in ('true','1','yes')
+KEEP=max(1,min(500,int(os.getenv('BACKUP_KEEP','50'))))
+LIMIT=max(300_000,min(25_000_000,int(os.getenv('MAX_APP_DOC_BYTES','3000000'))))
+lock=threading.RLock(); app=Flask(__name__);app.json.ensure_ascii=False;app.config['MAX_CONTENT_LENGTH']=LIMIT+100_000
 
-VERSION='v2.0.0'
-AUTH=os.getenv('AUTH_ENABLED','true').lower() in ('true','1','yes')
-APP_TOKEN=os.getenv('APP_API_TOKEN','')
-ADMIN_TOKEN=os.getenv('ADMIN_TOKEN','')
-ORIGINS={x.strip().rstrip('/') for x in os.getenv('PWA_ALLOWED_ORIGIN','').split(',') if x.strip()}
-MAX_DOC=max(300000,min(25000000,int(os.getenv('MAX_APP_DOC_BYTES','3000000'))))
-MAX_UPLOAD=min(60, max(5,int(os.getenv('MAX_FRONTEND_ZIP_MB','30'))))*1024*1024
-BASE=Path(__file__).resolve().parent
+def now():return datetime.now(timezone.utc).isoformat()
+def db():
+ c=sqlite3.connect(DB,timeout=20,isolation_level=None);c.row_factory=sqlite3.Row
+ c.execute('PRAGMA foreign_keys=ON');c.execute('PRAGMA journal_mode=WAL');c.execute('PRAGMA synchronous=FULL');c.execute('PRAGMA busy_timeout=20000');return c
 
-if AUTH and (not APP_TOKEN or APP_TOKEN.startswith('HIER_') or APP_TOKEN.lower() in {'changeme','password','test'}):
-    raise RuntimeError('APP_API_TOKEN fehlt oder ist noch ein Beispielwert; Server nicht gestartet.')
-if not ADMIN_TOKEN or ADMIN_TOKEN.startswith('HIER_') or ADMIN_TOKEN.lower() in {'changeme','password','test'} or ADMIN_TOKEN == APP_TOKEN or len(ADMIN_TOKEN)<24:
-    raise RuntimeError('ADMIN_TOKEN muss unabhängig und mindestens 24 Zeichen lang sein.')
+def init():
+ try:
+  ROOT.mkdir(parents=True,exist_ok=True);BACKUPS.mkdir(parents=True,exist_ok=True)
+  with tempfile.TemporaryFile(dir=ROOT) as f:f.write(b'ok')
+  c=db()
+  try:
+   c.execute('BEGIN IMMEDIATE')
+   c.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)')
+   versions=[r[0] for r in c.execute('SELECT version FROM schema_migrations')]
+   if any(v>SCHEMA for v in versions):raise RuntimeError('Database schema unsupported')
+   c.execute('CREATE TABLE IF NOT EXISTS app_documents(app_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)')
+   c.execute('CREATE TABLE IF NOT EXISTS players(id TEXT PRIMARY KEY, name TEXT NOT NULL, updated_at TEXT NOT NULL)')
+   c.execute('CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+   c.execute('INSERT OR IGNORE INTO schema_migrations VALUES(?,?)',(1,now()))
+   c.execute('COMMIT')
+  except:
+   if c.in_transaction:c.execute('ROLLBACK')
+   raise
+  finally:c.close()
+  if AUTH and len(API_TOKEN)<32:raise RuntimeError('AUTH_ENABLED=true requires APP_API_TOKEN (min. 32 chars)')
+ except Exception as e:
+  print('FATAL: Database migration failed or cannot write to /app/data: '+str(e),file=sys.stderr,flush=True);raise
 
-app=Flask(__name__,static_folder=None)
-app.config['MAX_CONTENT_LENGTH']=max(MAX_UPLOAD+4*1024*1024,MAX_DOC+1024*1024)
-init()
+def error(msg,status=400):return jsonify({'error':msg}),status
 
+def valid_app(s):return isinstance(s,str) and bool(re.fullmatch('[a-z][a-z0-9_-]{1,39}',s))
+def valid_id(s):return isinstance(s,str) and bool(re.fullmatch('[A-Za-z0-9_-]{8,80}',s))
+def validate_doc(payload):
+ if not isinstance(payload,dict):raise ValueError('Dokument muss ein JSON-Objekt sein')
+ blob=json.dumps(payload,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+ if len(blob.encode())>LIMIT:raise ValueError('Dokument zu gross')
+ return blob
 
-def err(message,status=400,**extra):return jsonify(error=message,**extra),status
+def snapshot(c):
+ return {'format':'spiele-zentrale-backup','version':1,'createdAt':now(),
+         'apps':[{'id':r['app_id'],'revision':r['revision'],'data':json.loads(r['payload'])} for r in c.execute('SELECT * FROM app_documents ORDER BY app_id')],
+         'players':[dict(r) for r in c.execute('SELECT * FROM players ORDER BY id')]}
 
-def token_ok(received,actual):return bool(actual) and hmac.compare_digest(received or '',actual)
-
-def same_origin():
-    origin=request.headers.get('Origin','')
-    if not origin:return True # Non-browser clients must still supply the auth token
-    u=urlsplit(origin)
-    return u.scheme in ('http','https') and u.netloc.lower()==request.host.lower()
+def backup(c,tag):
+ data=snapshot(c)
+ name=f'{tag}-{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")}.json'
+ with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=BACKUPS,delete=False) as t:
+  json.dump(data,t,ensure_ascii=False);t.flush();os.fsync(t.fileno());tmp=t.name
+ os.replace(tmp,BACKUPS/name)
+ for p in sorted(BACKUPS.glob('*.json'),key=lambda x:x.stat().st_mtime,reverse=True)[KEEP:]:p.unlink()
+ return name
 
 @app.before_request
-def access():
-    origin=request.headers.get('Origin','')
-    if origin and not (same_origin() or origin.rstrip('/') in ORIGINS):
-        return err('Origin not allowed',403)
-    if request.method=='OPTIONS':return Response(status=204)
-    if request.path.startswith('/admin/api/'):
-        if not token_ok(request.headers.get('X-Admin-Token',''),ADMIN_TOKEN):return err('Admin-Token fehlt oder ungültig',401)
-        if request.method not in ('GET','HEAD') and not same_origin():return err('Admin-Aktion nur von gleicher Origin',403)
-    if request.path.startswith('/api/') and request.path not in ('/api/health','/api/config','/api/apps'):
-        auth=request.headers.get('Authorization','')
-        if AUTH and (not auth.startswith('Bearer ') or not token_ok(auth[7:],APP_TOKEN)):
-            return err('Unauthorized',401)
-    if request.path.startswith('/api/v1/apps/'):
-        parts=request.path.split('/')
-        if len(parts)>4:
-            app_id=parts[4]
-            if not VALID_ID.fullmatch(app_id):return err('Ungültige App-ID',404)
-            with connect() as c:
-                if not state_allowed(c,app_id):return err('Dieses Spiel ist gesperrt oder entfernt',410,app_id=app_id)
+def auth_guard():
+ origin=request.headers.get('Origin')
+ if origin:
+  parsed=urlsplit(origin);same=parsed.scheme in ('http','https') and parsed.netloc.lower()==request.host.lower()
+  if not same and origin not in ORIGINS:return error('Origin not allowed',403)
+ if request.method=='OPTIONS':return Response(status=204)
+ if AUTH and request.path.startswith('/api/') and request.path not in ('/api/health','/api/config'):
+  if not hmac.compare_digest(request.headers.get('Authorization',''),'Bearer '+API_TOKEN):return error('Unauthorized',401)
 
 @app.after_request
 def secure_headers(resp):
-    origin=request.headers.get('Origin','')
-    if origin and (same_origin() or origin.rstrip('/') in ORIGINS):
-        resp.headers['Access-Control-Allow-Origin']=origin
-        resp.headers['Vary']='Origin'
-        resp.headers['Access-Control-Allow-Headers']='Content-Type,Authorization,CF-Access-Client-Id,CF-Access-Client-Secret'
-        resp.headers['Access-Control-Allow-Methods']='GET,POST,PUT,PATCH,DELETE,OPTIONS'
-        resp.headers['Access-Control-Max-Age']='600'
-    resp.headers['X-Content-Type-Options']='nosniff'
-    resp.headers['Referrer-Policy']='no-referrer'
-    resp.headers['X-Frame-Options']='DENY'
-    if request.path=='/' or request.path.startswith(('/admin','/static/')):
-        resp.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; connect-src 'self'; form-action 'self'"
-    resp.headers['Cache-Control']='no-store' if request.path.startswith(('/api/','/admin/')) else 'no-cache'
-    return resp
+ origin=request.headers.get('Origin')
+ if origin in ORIGINS:
+  resp.headers['Access-Control-Allow-Origin']=origin;resp.headers['Vary']='Origin'
+  resp.headers['Access-Control-Allow-Headers']='Content-Type,Authorization,CF-Access-Client-Id,CF-Access-Client-Secret'
+  resp.headers['Access-Control-Allow-Methods']='GET,POST,PUT,DELETE,OPTIONS';resp.headers['Access-Control-Max-Age']='600'
+ resp.headers['X-Content-Type-Options']='nosniff';resp.headers['Referrer-Policy']='no-referrer'
+ resp.headers['Cache-Control']='no-store';resp.headers['X-Frame-Options']='DENY'
+ return resp
 
+@app.errorhandler(ValueError)
+def invalid(e):return error(str(e))
 @app.errorhandler(413)
-def too_big(e):return err('Anfrage zu gross',413)
-
-@app.errorhandler(404)
-def page_not_found(e):return err('Nicht gefunden',404) if request.path.startswith(('/api/','/admin/api/')) else ('Nicht gefunden',404)
-
-@app.get('/api/health')
+def oversize(e):return error('Anfrage zu gross',413)
 @app.get('/health')
-def health():return jsonify(status='ok',version=VERSION,schema=1)
-
+@app.get('/api/health')
+def health():return jsonify(status='ok',version=VERSION,schema=SCHEMA)
 @app.get('/api/config')
-def config():return jsonify(version=VERSION,service='Spiele-Zentrale',auth_enabled=AUTH,storage='server',api='v1',maxAppDocumentBytes=MAX_DOC)
-
-@app.get('/api/apps')
-def installed_list():
-    with connect() as c:
-        rows=list_apps(c)
-    return jsonify(apps=[{'id':r['app_id'],'name':r['display_name'],'url':'/apps/'+r['app_id']+'/',
-                           'available':r['state']=='active' and bool(r['frontend_installed'])} for r in rows
-                         if r['state']=='active' and r['frontend_installed']])
-
-@app.route('/api/v1/apps/<app_id>/state',methods=['GET','PUT'])
-def state(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige App-ID',404)
-    if request.method=='GET':
-        with connect() as c:
-            if not state_allowed(c,app_id):return err('App deaktiviert',410)
-            doc=get_doc(c,app_id)
-        return jsonify(**doc,app_id=app_id)
-    if request.content_length and request.content_length>MAX_DOC+1024*1024: return err('App-Dokument zu gross',413)
-    body=request.get_json(silent=True)
-    if not isinstance(body,dict) or 'data' not in body or type(body.get('revision')) is not int or body['revision']<0:
-        return err('Erwartet JSON: data und revision (nichtnegative Ganzzahl)')
-    payload=json.dumps(body['data'],ensure_ascii=False,separators=(',',':')).encode('utf-8')
-    if len(payload)>MAX_DOC:return err('App-Dokument zu gross',413,maxAppDocumentBytes=MAX_DOC)
-    try:
-        with transaction() as c:
-            if not state_allowed(c,app_id):return err('App deaktiviert oder entfernt',410)
-            rev=set_doc(c,app_id,body['data'],body['revision'])
-            if rev is None:return err('Konflikt: neuere Serverrevision vorhanden',409)
-            audit(c,'app_state_saved',app_id,str(rev))
-        return jsonify(status='ok',revision=rev,updatedAt=utc())
-    except sqlite3.IntegrityError:return err('Paralleländerung; bitte Serverstand neu laden',409)
-
-@app.get('/api/v1/apps/<app_id>/snapshots')
-def snapshots(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige App-ID',404)
-    with connect() as c:
-        rows=c.execute('SELECT id,app_id,revision,created_at,reason FROM platform_app_backups WHERE app_id=? ORDER BY rowid DESC LIMIT 100',(app_id,)).fetchall()
-    return jsonify(snapshots=[dict(r) for r in rows])
-
-@app.post('/api/v1/apps/<app_id>/snapshots')
-def create_snapshot(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige App-ID',404)
-    with transaction() as c:
-        if not state_allowed(c,app_id):return err('App gesperrt',410)
-        current=get_doc(c,app_id)
-        if current['data'] is None:return err('Kein Spielstand vorhanden',404)
-        sid=str(uuid.uuid4())
-        c.execute('INSERT INTO platform_app_backups VALUES(?,?,?,?,?,?)',(
-            sid,app_id,current['revision'],json.dumps(current['data'],ensure_ascii=False),utc(),'manual_snapshot'))
-    return jsonify(status='ok',snapshot_id=sid,revision=current['revision']),201
-
-@app.post('/api/v1/apps/<app_id>/restore')
-def restore_snapshot(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige App-ID',404)
-    body=request.get_json(silent=True) or {}
-    sid=str(body.get('snapshot_id',''))
-    rev=body.get('revision')
-    if not re.fullmatch(r'[a-f0-9-]{36}',sid) or type(rev) is not int or rev<0:
-        return err('snapshot_id und aktuelle revision benötigt')
-    with transaction() as c:
-        if not state_allowed(c,app_id):return err('App gesperrt',410)
-        row=c.execute('SELECT data_json FROM platform_app_backups WHERE id=? AND app_id=?',(sid,app_id)).fetchone()
-        if not row:return err('Snapshot nicht gefunden',404)
-        data=json.loads(row['data_json'])
-        if len(row['data_json'].encode('utf-8'))>MAX_DOC:return err('Snapshot überschreitet aktuelles Datenlimit',413)
-        next_rev=set_doc(c,app_id,data,rev)
-        if next_rev is None:return err('Konflikt: neuere Serverrevision vorhanden',409)
-        audit(c,'snapshot_restored',app_id,sid)
-    return jsonify(status='ok',revision=next_rev)
-
-# Generic players API (existing shared-profile tables remain untouched).
-@app.get('/api/v1/players')
-def players_list():
-    with connect() as c:rows=all_players(c)
-    return jsonify(players=rows,items=rows)
-
-@app.post('/api/v1/players')
-def players_add():
-    import uuid
-    body=request.get_json(silent=True) or {}
-    name=str(body.get('name','')).strip()
-    if not name or len(name)>80:return err('Name fehlt oder ist zu lang')
-    identifier=body.get('id') or str(uuid.uuid4());identifier=str(identifier)
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{5,80}',identifier):return err('Ungültige Spieler-ID')
-    with transaction() as c:
-        try:add_player(c,identifier,name)
-        except sqlite3.IntegrityError:return err('Spieler-ID existiert bereits',409)
-    return jsonify(id=identifier,name=name),201
-
+def config():return jsonify(version=VERSION,service='Spiele-Zentrale',auth_enabled=AUTH,storage='server',api='v1',maxAppDocumentBytes=LIMIT)
 @app.get('/')
-def home():return send_from_directory(BASE/'static','index.html')
-@app.get('/admin/')
-@app.get('/admin')
-def admin_page():return send_from_directory(BASE/'static','admin.html')
-@app.get('/static/<path:name>')
-def static(name):
-    if name not in {'site.css','home.js','admin.js'}:abort(404)
-    return send_from_directory(BASE/'static',name)
-@app.get('/apps/<app_id>')
-def game_redirect(app_id):return redirect('/apps/'+app_id+'/',code=308)
-@app.get('/apps/<app_id>/')
-@app.get('/apps/<app_id>/<path:filepath>')
-def serve_game(app_id,filepath='index.html'):
-    if not VALID_ID.fullmatch(app_id):abort(404)
-    with connect() as c:
-        r=registry(c,app_id)
-        if r and r['state']!='active':return 'Spiel ist deaktiviert oder entfernt',410
-    folder=app_folder(app_id)
-    if not folder.exists() or not (folder/'index.html').is_file():abort(404)
-    if filepath.startswith('.') or '/.' in filepath or '\\' in filepath:abort(404)
-    response=send_from_directory(folder,filepath)
-    if filepath.endswith(('.html','.webmanifest','.js','.css','.json')):
-        response.headers['Cache-Control']='no-cache'
-    return response
+def home():return jsonify(service='Spiele-Zentrale',version=VERSION,docs='/api/config')
 
+@app.get('/api/v1/apps')
+def apps():
+ c=db()
+ try:return jsonify(items=[{'id':r['app_id'],'revision':r['revision'],'updatedAt':r['updated_at']} for r in c.execute('SELECT app_id,revision,updated_at FROM app_documents ORDER BY app_id')])
+ finally:c.close()
 
-def admin_app_info(c,app_id):
-    infos=list_apps(c)
-    return next((r for r in infos if r['app_id']==app_id),None)
+@app.get('/api/v1/apps/<app_id>/state')
+def get_state(app_id):
+ if not valid_app(app_id):return error('Ungültige Spielkennung')
+ c=db()
+ try:
+  r=c.execute('SELECT revision,payload,updated_at FROM app_documents WHERE app_id=?',(app_id,)).fetchone()
+  return jsonify({'revision':r['revision'],'data':json.loads(r['payload']),'updatedAt':r['updated_at']}) if r else jsonify({'revision':0,'data':None,'updatedAt':None})
+ finally:c.close()
 
-@app.get('/admin/api/apps')
-def admin_apps():
-    with connect() as c:apps=list_apps(c)
-    for item in apps:item['installed_info']=manifest(item['app_id'])
-    return jsonify(apps=apps,dbFile=db_path().name,maxZipMb=MAX_UPLOAD//1024//1024)
+@app.put('/api/v1/apps/<app_id>/state')
+def put_state(app_id):
+ if not valid_app(app_id):return error('Ungültige Spielkennung')
+ body=request.get_json(silent=True)
+ if not isinstance(body,dict) or type(body.get('revision'))!=int or body['revision']<0:return error('Revision fehlt')
+ blob=validate_doc(body.get('data'))
+ with lock:
+  c=db()
+  try:
+   c.execute('BEGIN IMMEDIATE')
+   r=c.execute('SELECT revision FROM app_documents WHERE app_id=?',(app_id,)).fetchone()
+   current=r[0] if r else 0
+   if body['revision']!=current:
+    c.execute('ROLLBACK');return error('Revision conflict',409)
+   backup(c,'before-write')
+   new=current+1
+   c.execute('INSERT INTO app_documents(app_id,revision,payload,updated_at) VALUES(?,?,?,?) ON CONFLICT(app_id) DO UPDATE SET revision=excluded.revision,payload=excluded.payload,updated_at=excluded.updated_at',(app_id,new,blob,now()))
+   c.execute('COMMIT');return jsonify(revision=new)
+  except:
+   if c.in_transaction:c.execute('ROLLBACK')
+   raise
+  finally:c.close()
 
-@app.post('/admin/api/apps/install')
-def admin_install():
-    app_id=str(request.form.get('app_id','')).strip()
-    name=str(request.form.get('display_name','')).strip() or app_id
-    if not VALID_ID.fullmatch(app_id):return err('Spielkennung: 2–40 Zeichen, Kleinbuchstaben/Ziffern/Bindestrich/_')
-    if len(name)>80:return err('Spielname zu lang')
-    source=request.files.get('zip')
-    if not source:return err('ZIP-Datei fehlt')
-    if not source.filename.lower().endswith('.zip'):return err('Nur ZIP-Dateien')
-    # refuse replacing a previously deleted app unless explicit reactivation is chosen
-    with connect() as c:
-        current=registry(c,app_id)
-    if current and current['state']=='deleted' and request.form.get('reactivate')!='yes':
-        return err('App wurde endgültig gelöscht: bewusste Reaktivierung erforderlich',409)
-    if current and current['frontend_installed'] and request.form.get('overwrite')!='yes':
-        return err('Frontend vorhanden: Update ausdrücklich bestätigen',409)
-    with tempfile.TemporaryDirectory(prefix='upload-') as tmp:
-        path=Path(tmp)/'upload.zip'
-        source.save(path)
-        if path.stat().st_size>MAX_UPLOAD:return err('ZIP überschreitet Upload-Limit',413)
-        try:validated_files(path)
-        except (ValueError,zipfile.BadZipFile,RuntimeError,OSError,UnicodeDecodeError) as exc:
-            return err('ZIP nicht installiert: '+str(exc),400)
-        backup=full_backup('before-install-'+app_id)
-        frontend_backup=backup_frontend(app_id,'before-update')
-        try:info=install(app_id,path,patch_lan=request.form.get('lan_patch')=='yes')
-        except (ValueError,zipfile.BadZipFile,RuntimeError,OSError,UnicodeDecodeError) as exc:
-            return err('ZIP nicht installiert: '+str(exc),400)
-        with transaction() as c:
-            set_registry(c,app_id,name=name,frontend=True,state='active')
-            audit(c,'frontend_installed',app_id,'DB backup '+backup.name)
-        return jsonify(status='ok',backup=backup.name,frontend_backup=frontend_backup,**info)
+@app.get('/api/v1/players')
+def players():
+ c=db()
+ try:return jsonify(items=[dict(r) for r in c.execute('SELECT * FROM players ORDER BY name')])
+ finally:c.close()
+@app.put('/api/v1/players/<player_id>')
+def put_player(player_id):
+ if not valid_id(player_id):return error('Ungültige Spieler-ID')
+ obj=request.get_json(silent=True)
+ if not isinstance(obj,dict) or not isinstance(obj.get('name'),str) or not 1<=len(obj['name'].strip())<=60:return error('Ungültiger Name')
+ with lock:
+  c=db()
+  try:
+   c.execute('BEGIN IMMEDIATE');backup(c,'before-player')
+   c.execute('INSERT INTO players(id,name,updated_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at',(player_id,obj['name'].strip(),now()))
+   c.execute('COMMIT');return jsonify(id=player_id,name=obj['name'].strip())
+  except:
+   if c.in_transaction:c.execute('ROLLBACK')
+   raise
+  finally:c.close()
 
-@app.get('/admin/api/apps/<app_id>/download')
-def admin_download_frontend(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige ID',404)
-    archive=backup_frontend(app_id,'download')
-    if not archive:return err('Kein Frontend installiert',404)
-    folder=Path(os.getenv('DATA_DIR','/app/data')).resolve()/'backups'/'frontends'
-    return send_from_directory(folder,archive,as_attachment=True,mimetype='application/zip')
+@app.get('/api/v1/export')
+def export():
+ c=db()
+ try:data=snapshot(c)
+ finally:c.close()
+ return Response(json.dumps(data,ensure_ascii=False,indent=2),mimetype='application/json',headers={'Content-Disposition':'attachment; filename="spiele-backup.json"'})
 
-@app.post('/admin/api/apps/<app_id>/toggle')
-def admin_toggle(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige ID',404)
-    req=request.get_json(silent=True) or {}
-    state=req.get('state')
-    if state not in ('active','disabled'):return err('Nur active/disabled zulässig')
-    with transaction() as c:
-        current=registry(c,app_id)
-        if current and current['state']=='deleted':return err('Gelöschte App muss neu installiert werden',409)
-        set_registry(c,app_id,state=state)
-        audit(c,'app_'+state,app_id)
-    return jsonify(status='ok',state=state)
+@app.post('/api/v1/restore/preview')
+def preview():
+ body=request.get_json(silent=True)
+ apps,players=validate_backup(body)
+ c=db()
+ try:existing={r[0] for r in c.execute('SELECT app_id FROM app_documents')}
+ finally:c.close()
+ return jsonify(apps=len(apps),players=len(players),conflicts=sorted(existing.intersection(x['id'] for x in apps)),mode='replace',message='Restore ersetzt sämtliche Serverdaten; Sicherheitsbackup wird automatisch erstellt')
 
-@app.post('/admin/api/apps/<app_id>/uninstall')
-def admin_uninstall(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige ID',404)
-    body=request.get_json(silent=True) or {}
-    if body.get('confirm') != 'ENTFERNEN '+app_id:return err('Bestätigung muss ENTFERNEN '+app_id+' lauten')
-    backup=full_backup('before-uninstall-'+app_id)
-    frontend_backup=backup_frontend(app_id)
-    with transaction() as c:
-        set_registry(c,app_id,frontend=False,state='disabled')
-        audit(c,'frontend_removed',app_id,backup.name)
-    remove_frontend(app_id)
-    return jsonify(status='ok',state='disabled',data_kept=True,backup=backup.name,frontend_backup=frontend_backup)
+def validate_backup(body):
+ if not isinstance(body,dict) or body.get('format')!='spiele-zentrale-backup' or body.get('version')!=1:raise ValueError('Unbekanntes Backupformat')
+ apps=body.get('apps');players=body.get('players')
+ if not isinstance(apps,list) or not isinstance(players,list) or len(apps)>100 or len(players)>10000:raise ValueError('Ungültiger Backup-Inhalt')
+ seen=set();ids=set()
+ for a in apps:
+  if not isinstance(a,dict) or not valid_app(a.get('id')) or a['id'] in seen or type(a.get('revision'))!=int or a['revision']<0:raise ValueError('Ungültige Apps')
+  validate_doc(a.get('data'));seen.add(a['id'])
+ for p in players:
+  if not isinstance(p,dict) or not valid_id(p.get('id')) or p['id'] in ids or not isinstance(p.get('name'),str) or not 1<=len(p['name'].strip())<=60:raise ValueError('Ungültige Spieler')
+  ids.add(p['id'])
+ return apps,players
 
-@app.post('/admin/api/apps/<app_id>/delete')
-def admin_delete(app_id):
-    if not VALID_ID.fullmatch(app_id):return err('Ungültige ID',404)
-    body=request.get_json(silent=True) or {}
-    if body.get('confirm')!='LÖSCHEN '+app_id:
-        return err('Bestätigung muss LÖSCHEN '+app_id+' lauten')
-    backup=full_backup('before-delete-'+app_id)
-    frontend_backup=backup_frontend(app_id,'before-delete')
-    with transaction() as c:
-        original=remove_doc(c,app_id)
-        c.execute('DELETE FROM platform_app_backups WHERE app_id=?',(app_id,))  # Archive only in external SQLite backup
-        set_registry(c,app_id,frontend=False,state='deleted')
-        audit(c,'app_deleted',app_id,backup.name)
-    remove_frontend(app_id)
-    return jsonify(status='ok',deleted=True,backup=backup.name,frontend_backup=frontend_backup,previousRevision=original['revision'])
+@app.post('/api/v1/restore')
+def restore():
+ body=request.get_json(silent=True)
+ if not isinstance(body,dict) or body.get('confirm')!='REPLACE_ALL':return error('Bestätigung REPLACE_ALL fehlt')
+ apps,players=validate_backup(body.get('backup'))
+ with lock:
+  c=db()
+  try:
+   c.execute('BEGIN IMMEDIATE');backup(c,'before-restore')
+   c.execute('DELETE FROM app_documents');c.execute('DELETE FROM players')
+   for a in apps:c.execute('INSERT INTO app_documents VALUES(?,?,?,?)',(a['id'],a['revision'],validate_doc(a['data']),now()))
+   for p in players:c.execute('INSERT INTO players VALUES(?,?,?)',(p['id'],p['name'].strip(),now()))
+   c.execute('COMMIT');return jsonify(status='ok',apps=len(apps),players=len(players))
+  except:
+   if c.in_transaction:c.execute('ROLLBACK')
+   raise
+  finally:c.close()
 
-@app.post('/admin/api/backup')
-def admin_backup():
-    backup=full_backup('manual')
-    with transaction() as c:audit(c,'backup_created',detail=backup.name)
-    return jsonify(status='ok',backup=backup.name)
-
-@app.get('/admin/api/backups')
-def admin_backups():
-    folder=Path(os.getenv('DATA_DIR','/app/data')).resolve()/'backups'
-    items=sorted(folder.glob('*.sqlite'),reverse=True)[:100] if folder.exists() else []
-    fronts=folder/'frontends'
-    front_items=sorted(fronts.glob('*.zip'),reverse=True)[:100] if fronts.exists() else []
-    return jsonify(backups=[{'name':f.name,'sizeBytes':f.stat().st_size,'createdAt':datetime.fromtimestamp(f.stat().st_mtime,timezone.utc).isoformat(),'kind':'sqlite'} for f in items]+
-                   [{'name':f.name,'sizeBytes':f.stat().st_size,'createdAt':datetime.fromtimestamp(f.stat().st_mtime,timezone.utc).isoformat(),'kind':'frontend'} for f in front_items])
-
-@app.get('/admin/api/frontends/backups/<name>')
-def admin_download_frontend_backup(name):
-    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,170}\.zip',name):abort(404)
-    folder=Path(os.getenv('DATA_DIR','/app/data')).resolve()/'backups'/'frontends'
-    if not (folder/name).is_file():abort(404)
-    return send_from_directory(folder,name,as_attachment=True,mimetype='application/zip')
-
-@app.get('/admin/api/backups/<name>')
-def admin_download(name):
-    if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,150}\.sqlite',name):abort(404)
-    folder=Path(os.getenv('DATA_DIR','/app/data')).resolve()/'backups'
-    if not (folder/name).is_file():abort(404)
-    return send_from_directory(folder,name,as_attachment=True,mimetype='application/vnd.sqlite3')
-
-if __name__=='__main__':app.run(host='0.0.0.0',port=8080,debug=False)
+init()
