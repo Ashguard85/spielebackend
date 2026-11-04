@@ -2,12 +2,16 @@ services:
   spiele-zentrale:
     build:
       context: https://github.com/Ashguard85/spielebackend.git#main
+
     container_name: spiele-zentrale
     restart: unless-stopped
+
     ports:
       - "8110:8080"
+
     volumes:
       - /home/buebi/docker/spiele-zentrale/data:/app/data
+
     environment:
       DATA_DIR: "/app/data"
       AUTH_ENABLED: "true"
@@ -17,11 +21,14 @@ services:
       BACKUP_KEEP: "50"
       MAX_APP_DOC_BYTES: "20000000"
       MAX_FRONTEND_ZIP_MB: "30"
+      DEVICE_SESSION_DAYS: "180"
       REQUIRE_EXISTING_DB: "1"
+
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8080),4); s.close()"]
       interval: 30s
       timeout: 6s
       retries: 4
+
     security_opt:
       - no-new-privileges:true

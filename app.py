@@ -1,11 +1,11 @@
-"""Spiele-Zentrale v2.0.2 – single-file Git build for Portainer.
+"""Spiele-Zentrale v2.1.0 – single-file Git build for Portainer and LAN hosting.
 
 All platform code and admin assets are intentionally kept in app.py so Docker's
 remote Git build only requires root-level files. Existing game data remains in
 the mounted SQLite database.
 """
 from __future__ import annotations
-import os, json, re, hmac, tempfile, zipfile, sqlite3, traceback, uuid, stat, shutil, hashlib
+import os, json, re, hmac, tempfile, zipfile, sqlite3, traceback, uuid, stat, shutil, hashlib, secrets, time
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
@@ -126,6 +126,20 @@ def init():
           created_at TEXT NOT NULL, detail TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS platform_player_profiles (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+        # Shared catalogue is additive; app_documents and historic player IDs stay untouched.
+        c.execute('''CREATE TABLE IF NOT EXISTS platform_shared_players (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS platform_shared_areas (
+          code TEXT PRIMARY KEY, code_key TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS platform_shared_player_links (
+          app_id TEXT NOT NULL, area_code TEXT NOT NULL, local_id TEXT NOT NULL,
+          shared_id TEXT NOT NULL REFERENCES platform_shared_players(id),
+          created_at TEXT NOT NULL, PRIMARY KEY(app_id,area_code,local_id))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS platform_device_sessions (
+          token_hash TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL, expires_at INTEGER NOT NULL)''')
 
 
 def as_dict(row): return dict(row) if row else None
@@ -443,10 +457,10 @@ def manifest(app_id):
     return None
 
 
-STATIC_ASSETS={'index.html': '<!doctype html><html lang="de-CH"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#177f83"><title>Spiele-Zentrale</title><link rel="stylesheet" href="/static/site.css"></head><body>\n<header class="top"><div class="shell row-between"><div class="brand"><div class="brand-mark">▦</div><div><strong>Spiele-Zentrale</strong><small>Deine Spiele auf dem Ubuntu-Server</small></div></div><a class="subtle-link" href="/admin/">Verwaltung</a></div></header>\n<main class="shell"><div class="intro"><span class="eyebrow">Deine Spiele</span><h1>Was spielen wir heute?</h1><p>Alle hier installierten Spiele laufen direkt auf deinem Server. Die Daten liegen in der zentralen SQLite-Datenbank.</p></div><section class="tiles" id="apps" aria-live="polite"><div class="empty">Installierte Spiele werden geladen …</div></section><section class="hint"><h2>Noch ein Spiel hinzufügen?</h2><p>In der <a href="/admin/">Verwaltung</a> kannst du die ZIP-Pakete deiner bestehenden Yatzy- und Flip-7-PWAs importieren und aktualisieren.</p></section></main><footer class="shell foot">Nur im Heimnetz? Ein Cloudflare Tunnel ist für den Zugriff über die LAN-IP nicht nötig. Für volle PWA-/Offline-Funktionen auf dem iPhone ist vertrauenswürdiges HTTPS erforderlich.</footer><script src="/static/home.js" defer></script></body></html>\n', 'admin.html': '<!doctype html><html lang="de-CH"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#177f83"><title>Verwaltung · Spiele-Zentrale</title><link rel="stylesheet" href="/static/site.css"></head><body>\n<header class="top"><div class="shell row-between"><div class="brand"><div class="brand-mark">▦</div><div><strong>Spiele-Zentrale</strong><small>Administration</small></div></div><a class="subtle-link" href="/">Zur Startseite</a></div></header>\n<main class="shell admin">\n<section class="intro"><span class="eyebrow">Server-Verwaltung</span><h1>Spiele verwalten</h1><p>Die Daten bleiben in einer gemeinsamen SQLite-Datenbank. Installationen und Löschungen erfordern einen separaten Administrator-Token.</p></section>\n<div class="notice warning">Nur eigene, vertrauenswürdige Frontend-ZIPs installieren: Enthaltenes JavaScript wird unter deiner Serveradresse ausgeführt. Im Heimnetz ist HTTP für normale Seiten möglich; API-/Admin-Tokens sind über HTTP jedoch nicht verschlüsselt. Für den produktiven iPhone-Betrieb empfehlen wir lokales HTTPS.</div>\n<section class="panel" aria-labelledby="accessHead"><h2 id="accessHead">Administratorzugang</h2><label class="field">Administrator-Token <input type="password" id="adminToken" autocomplete="off" spellcheck="false" placeholder="SPIELE_ADMIN_TOKEN aus deiner Portainer-Umgebung"></label><div class="actions"><button id="connect" class="button primary">Verbinden</button><button id="disconnect" class="button secondary">Trennen</button></div><p id="status" role="status" class="status">Nicht angemeldet. Der Token wird nur im Arbeitsspeicher dieser Seite gehalten.</p></section>\n<section class="panel" aria-labelledby="installedHead"><div class="row-between"><h2 id="installedHead">Installierte und gespeicherte Spiele</h2><button id="refresh" class="button secondary" disabled>Aktualisieren</button></div><div id="apps" class="app-list"><div class="empty">Mit Administrator-Token verbinden.</div></div></section>\n<section class="panel" aria-labelledby="installHead"><h2 id="installHead">Spiel-ZIP installieren oder aktualisieren</h2><form id="installForm"><div class="form-grid"><label class="field">Spielkennung (muss zur API passen)<input id="appId" name="app_id" pattern="[a-z][a-z0-9_-]{1,39}" required placeholder="yatzy oder flip7" autocomplete="off"></label><label class="field">Anzeigename<input id="displayName" name="display_name" maxlength="80" placeholder="Yatzy Duell"></label></div><label class="field">Pages-ZIP aus deinen bestehenden Releases<input type="file" id="zip" name="zip" accept=".zip,application/zip" required></label><label class="check"><input type="checkbox" id="overwrite" name="overwrite" value="yes"> Bestehendes Frontend bewusst aktualisieren</label><label class="check"><input type="checkbox" id="lanPatch" name="lan_patch" value="yes" checked> LAN-Adapter für bekannte Yatzy-/Flip-7-Versionen anwenden (lokales HTTP auf gleicher Serveradresse zulassen)</label><label class="check"><input type="checkbox" id="reactivate" name="reactivate" value="yes"> Zuvor vollständig gelöschtes Spiel ausdrücklich neu aktivieren</label><button type="submit" id="installButton" class="button primary">ZIP prüfen und installieren</button></form><p class="help">Es werden nur statische Dateien unter <code>/apps/spiel-id/</code> abgelegt. Kein Python- oder Node-Code aus dem ZIP wird ausgeführt. Vor jedem Update wird ein SQLite-Backup erstellt. Der Browser muss bei Yatzy und Flip 7 weiterhin einmalig den Spiele-API-Token erhalten.</p></section>\n<section class="panel" aria-labelledby="backupHead"><div class="row-between"><h2 id="backupHead">SQLite-Sicherungen</h2><button id="newBackup" class="button primary" disabled>Jetzt sichern</button></div><p>Vor Datenlöschungen wird eine vollständige SQLite-Kopie erstellt. Lade regelmässig eine Kopie ausserhalb des Ubuntu-Servers herunter.</p><div id="backups" class="backup-list"><div class="empty">Noch keine Liste geladen.</div></div></section>\n</main><footer class="shell foot">Backup-Dateien enthalten weiterhin gelöschte Spielstände. Für eine vollständige Datenentfernung müssen alte Backups separat und bewusst nach deinen Aufbewahrungsregeln gelöscht werden.</footer><script src="/static/admin.js" defer></script></body></html>\n', 'site.css': ":root{color-scheme:light dark;--bg:#f2f6f7;--paper:#fff;--text:#193039;--muted:#586e76;--border:#d9e5e7;--accent:#147f85;--accent2:#0b6066;--bad:#bb3f3f;--line:#dbe4e8;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}\n@media(prefers-color-scheme:dark){:root{--bg:#0d171b;--paper:#18272b;--text:#e4f2f3;--muted:#b0c3c8;--border:#334b51;--accent:#51b9ba;--accent2:#3aa9a9;--bad:#ed8888;--line:#334b51}}\n*{box-sizing:border-box}html{background:var(--bg);-webkit-text-size-adjust:100%}body{margin:0;background:var(--bg);color:var(--text);min-height:100vh}a{color:var(--accent2)}button,input{font:inherit}input:not([type=checkbox]):not([type=file]){display:block;width:100%;margin-top:7px;padding:11px 12px;border:1px solid var(--border);border-radius:10px;background:var(--paper);color:var(--text)}input[type=file]{display:block;width:100%;margin-top:9px;color:var(--text)}.shell{width:min(930px,calc(100% - 32px));margin:auto}.top{background:var(--paper);border-bottom:1px solid var(--border);padding:18px 0}.row-between{display:flex;align-items:center;justify-content:space-between;gap:12px}.brand{display:flex;align-items:center;gap:11px}.brand strong{display:block;font-size:18px}.brand small{display:block;color:var(--muted);font-size:12px;margin-top:3px}.brand-mark{border-radius:12px;background:var(--accent);color:#fff;font-size:27px;min-width:46px;min-height:46px;display:grid;place-items:center}.subtle-link{font-size:14px;text-decoration:none;color:var(--muted);font-weight:650}.intro{padding:35px 0 28px}.intro h1{font-size:clamp(29px,5.2vw,46px);letter-spacing:-.035em;margin:10px 0}.intro p{max-width:650px;color:var(--muted);line-height:1.6}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.15em;color:var(--accent2);font-weight:750}.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:15px}.game-tile{background:var(--paper);border:1px solid var(--border);border-radius:18px;padding:20px;display:flex;align-items:center;gap:16px;text-decoration:none;color:var(--text);min-height:118px;box-shadow:0 8px 22px #00000005}.game-tile:hover,.game-tile:focus-visible{outline:2px solid var(--accent)}.game-icon{font-size:34px}.game-tile h2{font-size:18px;margin:0}.game-tile p{font-size:13px;color:var(--muted);margin:6px 0 0}.arrow{margin-left:auto;font-size:27px;color:var(--accent)}.empty{background:var(--paper);border:1px dashed var(--border);padding:25px;color:var(--muted);border-radius:14px;line-height:1.5;grid-column:1/-1}.hint{background:var(--paper);border:1px solid var(--border);border-radius:16px;margin-top:36px;padding:24px}.hint h2{margin:0 0 8px;font-size:18px}.hint p{margin:0;color:var(--muted);line-height:1.5}.foot{color:var(--muted);padding:32px 0 44px;font-size:13px;line-height:1.6}.admin{display:grid;gap:20px}.admin .intro{padding-bottom:2px}.panel{background:var(--paper);border:1px solid var(--border);border-radius:17px;padding:22px}.panel h2{font-size:20px;margin:0 0 16px}.field{font-weight:600;font-size:14px;display:block;margin-bottom:16px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.button{display:inline-flex;align-items:center;justify-content:center;padding:9px 13px;min-height:40px;border:1px solid transparent;border-radius:10px;cursor:pointer;text-decoration:none;font-weight:650;font-size:14px}.button.primary{background:var(--accent2);color:white}.button.secondary{border-color:var(--border);background:transparent;color:var(--text)}.button.danger{border-color:var(--bad);background:transparent;color:var(--bad)}.button:disabled{opacity:.45;cursor:default}.status{color:var(--muted);font-size:14px;margin-bottom:0;line-height:1.5}.status.error{color:var(--bad)}.small,.help{color:var(--muted);font-size:13px;line-height:1.5}.help{margin-top:18px}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:15px}.notice{border-radius:14px;border:1px solid var(--border);padding:16px;line-height:1.5;font-size:14px}.notice.warning{border-color:#aa8153;background:color-mix(in srgb,var(--paper),#f3a31b 9%)}.check{display:flex;align-items:flex-start;gap:9px;font-size:14px;margin:15px 0;line-height:1.5}.check input{margin-top:4px;accent-color:var(--accent)}.app-list,.backup-list{display:grid;gap:12px}.app-row{padding:16px;border:1px solid var(--border);border-radius:12px}.app-row h3{margin:0 0 6px}.app-row p{margin:0}.pill{border-radius:20px;border:1px solid var(--border);font-size:12px;padding:5px 9px;color:var(--muted);white-space:nowrap}.pill.active{color:#177c5b}.pill.deleted{color:var(--bad)}.backup-row{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid var(--border);padding:12px 0;font-size:12px;word-break:break-word}code{font-size:12px;word-break:break-word}@media(max-width:600px){.top{padding:13px 0}.panel{padding:17px}.intro{padding:24px 0}.row-between{align-items:flex-start}.backup-row{flex-direction:column;align-items:flex-start}}\n", 'home.js': "'use strict';\nconst container=document.getElementById('apps');\nconst styles={yatzy:'🎲',flip7:'🃏'};\nfetch('/api/apps',{cache:'no-store'}).then(async r=>{if(!r.ok)throw Error('HTTP '+r.status);return r.json()}).then(data=>{\n container.replaceChildren();\n const apps=data.apps||[];\n if(!apps.length){let p=document.createElement('div');p.className='empty';p.textContent='Noch keine Frontends installiert. Importiere Yatzy oder Flip 7 über Verwaltung → Spiel-ZIP installieren.';container.append(p);return;}\n for(const app of apps){const a=document.createElement('a');a.className='game-tile';a.href=app.url;\n const icon=document.createElement('span');icon.className='game-icon';icon.textContent=styles[app.id]||'🎮';\n const label=document.createElement('div');const h=document.createElement('h2');h.textContent=app.name||app.id;\n const p=document.createElement('p');p.textContent='Spiel öffnen';label.append(h,p);\n const arrow=document.createElement('span');arrow.className='arrow';arrow.textContent='›';a.append(icon,label,arrow);container.append(a)}\n}).catch(error=>{container.textContent='Spiele konnten nicht geladen werden: '+error.message});\n", 'admin.js': "'use strict';\n// Admin token never enters localStorage, IndexedDB, cookies, URL or any backup.\n(()=>{\n let token='';const $=id=>document.getElementById(id);\n function setStatus(msg,isError=false){$('status').textContent=msg;$('status').className='status'+(isError?' error':'');}\n async function call(path,opts={}){\n  const headers={'X-Admin-Token':token,...(opts.body instanceof FormData?{}:{'Content-Type':'application/json'})};\n  const response=await fetch('/admin/api'+path,{...opts,headers,cache:'no-store',credentials:'omit'});\n  const ct=response.headers.get('content-type')||'';\n  const data=ct.includes('json')?await response.json():{};\n  if(!response.ok)throw Error(data.error||'HTTP '+response.status);\n  return data;\n }\n function button(label,callback,style='secondary'){\n  const b=document.createElement('button');b.type='button';b.className='button '+style;b.textContent=label;b.addEventListener('click',callback);return b;\n }\n async function guarded(operation){try{await operation()}catch(error){setStatus(error.message,true);alert(error.message)}}\n async function refresh(){\n  const result=await call('/apps');$('apps').replaceChildren();\n  if(!result.apps.length){const e=document.createElement('div');e.className='empty';e.textContent='Keine Spiele registriert.';$('apps').append(e)}\n  for(const app of result.apps){\n   const card=document.createElement('article');card.className='app-row';\n   const head=document.createElement('div');head.className='row-between';\n   const title=document.createElement('div');const h=document.createElement('h3');h.textContent=app.display_name||app.app_id;\n   const detail=document.createElement('p');detail.className='small';detail.textContent=app.app_id+' · '+(app.frontend_installed?'Frontend installiert':'Kein Frontend')+' · '+(app.has_data?'Spieldaten vorhanden':'Keine Spieldaten')+' · Revision '+app.revision;\n   const pill=document.createElement('span');pill.className='pill '+app.state;pill.textContent=app.state==='active'?'Aktiv':app.state==='disabled'?'Deaktiviert':'Gelöscht';\n   title.append(h,detail);head.append(title,pill);card.append(head);\n   const actions=document.createElement('div');actions.className='actions';\n   if(app.frontend_installed&&app.state==='active'){\n    const link=document.createElement('a');link.href='/apps/'+encodeURIComponent(app.app_id)+'/';link.className='button secondary';link.textContent='Öffnen';actions.append(link);\n   }\n   if(app.state!=='deleted'){\n    actions.append(button(app.state==='disabled'?'Aktivieren':'Deaktivieren',()=>guarded(async()=>{\n     const next=app.state==='disabled'?'active':'disabled';\n     if(!confirm('Spiel '+app.app_id+' '+(next==='active'?'aktivieren':'deaktivieren')+'? Alte PWAs erhalten bei Deaktivierung HTTP 410.'))return;\n     await call('/apps/'+app.app_id+'/toggle',{method:'POST',body:JSON.stringify({state:next})});await refresh();\n    })));\n   }\n   if(app.frontend_installed){actions.append(button('Frontend-ZIP sichern',()=>guarded(async()=>{await download('/apps/'+encodeURIComponent(app.app_id)+'/download',app.app_id+'-frontend.zip')}),'secondary'));actions.append(button('Nur Frontend entfernen',()=>guarded(async()=>{\n    const phrase='ENTFERNEN '+app.app_id;\n    if(prompt('Frontend entfernen und Spieldaten behalten? Das Spiel wird deaktiviert.\\nZum Bestätigen eingeben: '+phrase)!==phrase)return;\n    const r=await call('/apps/'+app.app_id+'/uninstall',{method:'POST',body:JSON.stringify({confirm:phrase})});\n    setStatus('Frontend entfernt. Vollständiges SQLite-Backup: '+r.backup);await refresh();await loadBackups();\n   }),'secondary'))}\n   if(app.has_data||app.frontend_installed||app.state==='disabled'){\n    actions.append(button('Spiel und Daten löschen',()=>guarded(async()=>{\n     const phrase='LÖSCHEN '+app.app_id;\n     if(prompt('ACHTUNG: App-Dokument und Frontend werden entfernt, API dauerhaft gesperrt. Vorher SQLite-Backup.\\nZum Bestätigen eingeben: '+phrase)!==phrase)return;\n     if(!confirm('Wirklich die Daten von '+app.app_id+' löschen? Andere Spiele und gemeinsame Profile bleiben erhalten.'))return;\n     const r=await call('/apps/'+app.app_id+'/delete',{method:'POST',body:JSON.stringify({confirm:phrase})});\n     setStatus('Spiel gelöscht und gesperrt. Backup: '+r.backup);await refresh();await loadBackups();\n    }),'danger'))\n   }\n   card.append(actions);$('apps').append(card);\n  }\n }\n async function download(path,name){\n  const response=await fetch('/admin/api'+path,{headers:{'X-Admin-Token':token},cache:'no-store',credentials:'omit'});\n  if(!response.ok)throw Error('Download: HTTP '+response.status);\n  const blob=await response.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');\n  a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);\n }\n async function loadBackups(){\n  const result=await call('/backups');$('backups').replaceChildren();\n  if(!result.backups.length){$('backups').textContent='Noch keine Backups.';return}\n  for(const item of result.backups){\n   const row=document.createElement('div');row.className='backup-row';\n   const label=document.createElement('span');label.textContent=item.name+' · '+(item.sizeBytes/1024).toFixed(1)+' KB';\n   row.append(label,button('Herunterladen',()=>guarded(async()=>{\n    await download(item.kind==='frontend'?'/frontends/backups/'+encodeURIComponent(item.name):'/backups/'+encodeURIComponent(item.name),item.name);\n   })));\n   $('backups').append(row);\n  }\n }\n $('connect').addEventListener('click',()=>guarded(async()=>{\n  token=$('adminToken').value.trim();$('adminToken').value='';\n  if(!token)throw Error('Administrator-Token fehlt');\n  await refresh();await loadBackups();$('refresh').disabled=false;$('newBackup').disabled=false;\n  setStatus('Angemeldet. Admin-Token ist nur in dieser geöffneten Seite im Arbeitsspeicher.');\n }));\n $('disconnect').addEventListener('click',()=>{token='';$('refresh').disabled=true;$('newBackup').disabled=true;setStatus('Getrennt. Browserseite neu laden, um die Sitzung zu verlassen.');$('apps').textContent='Nicht angemeldet.';$('backups').textContent='Nicht angemeldet.'});\n $('refresh').addEventListener('click',()=>guarded(async()=>{await refresh();await loadBackups();setStatus('Aktualisiert')}));\n $('newBackup').addEventListener('click',()=>guarded(async()=>{const r=await call('/backup',{method:'POST',body:'{}'});setStatus('SQLite-Sicherung: '+r.backup);await loadBackups()}));\n $('installForm').addEventListener('submit',e=>{e.preventDefault();guarded(async()=>{\n  if(!token)throw Error('Bitte zuerst Administrator-Token eingeben');\n  const appId=$('appId').value.trim(),file=$('zip').files[0];if(!file)throw Error('ZIP-Datei fehlt');\n  if(!confirm('Frontend-Paket '+file.name+' als '+appId+' installieren? Nur vertrauenswürdige Dateien verwenden.'))return;\n  const body=new FormData($('installForm'));\n  const r=await call('/apps/install',{method:'POST',body});\n  setStatus('Installiert: '+appId+' · DB-Backup '+r.backup+' · LAN-Anpassungen: '+(r.lan_adapter_changes||[]).join('; '));\n  await refresh();await loadBackups();\n })});\n})();\n"}
+STATIC_ASSETS={'index.html': '<!doctype html><html lang="de-CH"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#177f83"><title>Spiele-Zentrale</title><link rel="stylesheet" href="/static/site.css"></head><body>\n<header class="top"><div class="shell row-between"><div class="brand"><div class="brand-mark">▦</div><div><strong>Spiele-Zentrale</strong><small>Deine Spiele auf dem Ubuntu-Server</small></div></div><a class="subtle-link" href="/admin/">Verwaltung</a></div></header>\n<main class="shell"><div class="intro"><span class="eyebrow">Deine Spiele</span><h1>Was spielen wir heute?</h1><p>Alle hier installierten Spiele laufen direkt auf deinem Server. Die Daten liegen in der zentralen SQLite-Datenbank.</p></div><section class="tiles" id="apps" aria-live="polite"><div class="empty">Installierte Spiele werden geladen …</div></section><section class="hint"><h2>Noch ein Spiel hinzufügen?</h2><p>In der <a href="/admin/">Verwaltung</a> kannst du Yatzy, Flip 7, Brändi Fifty und weitere statische PWA-ZIPs importieren und aktualisieren.</p></section></main><footer class="shell foot">Nur im Heimnetz? Ein Cloudflare Tunnel ist für den Zugriff über die LAN-IP nicht nötig. Für volle PWA-/Offline-Funktionen auf dem iPhone ist vertrauenswürdiges HTTPS erforderlich.</footer><script src="/static/home.js" defer></script></body></html>\n', 'admin.html': '<!doctype html><html lang="de-CH"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><meta name="theme-color" content="#177f83"><title>Verwaltung · Spiele-Zentrale</title><link rel="stylesheet" href="/static/site.css"></head><body>\n<header class="top"><div class="shell row-between"><div class="brand"><div class="brand-mark">▦</div><div><strong>Spiele-Zentrale</strong><small>Administration</small></div></div><a class="subtle-link" href="/">Zur Startseite</a></div></header>\n<main class="shell admin">\n<section class="intro"><span class="eyebrow">Server-Verwaltung</span><h1>Spiele verwalten</h1><p>Die Daten bleiben in einer gemeinsamen SQLite-Datenbank. Installationen und Löschungen erfordern einen separaten Administrator-Token.</p></section>\n<div class="notice warning">Nur eigene, vertrauenswürdige Frontend-ZIPs installieren: Enthaltenes JavaScript wird unter deiner Serveradresse ausgeführt. Im Heimnetz ist HTTP für normale Seiten möglich; API-/Admin-Tokens sind über HTTP jedoch nicht verschlüsselt. Für den produktiven iPhone-Betrieb empfehlen wir lokales HTTPS.</div>\n<section class="panel" aria-labelledby="accessHead"><h2 id="accessHead">Administratorzugang</h2><label class="field">Administrator-Token <input type="password" id="adminToken" autocomplete="off" spellcheck="false" placeholder="SPIELE_ADMIN_TOKEN aus deiner Portainer-Umgebung"></label><div class="actions"><button id="connect" class="button primary">Verbinden</button><button id="disconnect" class="button secondary">Trennen</button></div><p id="status" role="status" class="status">Nicht angemeldet. Der Token wird nur im Arbeitsspeicher dieser Seite gehalten.</p></section>\n<section class="panel" aria-labelledby="deviceHead"><h2 id="deviceHead">Spiele-Zugang für dieses Gerät</h2><p class="help">Einmal den Spiele-API-Token eingeben. Der Token wird nur zur Prüfung gesendet und nicht im Browser gespeichert. Danach verwendet Yatzy, Flip 7 und Fifty einen sicheren HttpOnly-Gerätecookie auf dieser Spiele-Zentrale.</p><label class="field">Spiele-API-Token<input type="password" id="deviceApiToken" autocomplete="off" spellcheck="false" placeholder="SPIELE_API_TOKEN"></label><div class="actions"><button id="deviceLogin" class="button primary" type="button">Für alle Spiele anmelden</button><button id="deviceLogout" class="button secondary" type="button">Dieses Gerät abmelden</button><button id="deviceRevokeAll" class="button soft-danger" type="button" disabled>Alle Geräte abmelden</button></div><p id="deviceStatus" role="status" class="status">Gerätestatus wird geprüft …</p></section>\n<section class="panel" aria-labelledby="lanHead"><h2 id="lanHead">Lokaler Betrieb</h2><p class="help">Diese Zentrale kann Frontend und API unter derselben Serveradresse ausliefern. Für die drei bekannten Spiele ist keine GitHub-Pages-Adresse nötig.</p><div class="form-grid"><label class="field">Diese Spiele-Zentrale<input id="localOrigin" type="text" readonly></label><label class="field">API-Basis<input id="localApi" type="text" readonly></label></div><div class="actions"><button id="copyOrigin" type="button" class="button secondary">Serveradresse kopieren</button></div><p id="secureHint" class="status"></p></section>\n<section class="panel" aria-labelledby="sharedHead"><h2 id="sharedHead">Gemeinsame Spieler und Spielbereiche</h2><p class="help">Diese Liste gilt für Yatzy, Flip 7 und Brändi Fifty. Bestehende Partien werden beim Import nicht verändert. Gleiche Namen aus alten Spielen bitte vor dem Zusammenführen prüfen.</p><div class="form-grid"><label class="field">Neuer gemeinsamer Spieler<input type="text" maxlength="48" id="sharedPlayerName" placeholder="z. B. Peter"></label><label class="field">Neuer Bereich (Code)<input type="text" maxlength="40" id="sharedAreaCode" placeholder="z. B. familie"></label></div><div class="actions"><button class="button secondary" type="button" id="sharedAddPlayer" disabled>Spieler anlegen</button><button class="button secondary" type="button" id="sharedAddArea" disabled>Bereich anlegen</button><button class="button secondary" type="button" id="sharedScan" disabled>Vorhandene Spieler/Bereiche prüfen</button></div><p id="sharedMessage" class="status" role="status">Zuerst anmelden.</p><div class="form-grid"><div><h3>Gemeinsame Spieler</h3><div id="sharedPlayers" class="app-list"></div></div><div><h3>Gemeinsame Bereiche</h3><div id="sharedAreas" class="app-list"></div></div></div><div id="sharedCandidates"></div><div class="actions"><button type="button" class="button primary" id="sharedImport" disabled>Ausgewählte alte Einträge übernehmen</button></div></section>\n<section class="panel" aria-labelledby="installedHead"><div class="row-between"><h2 id="installedHead">Installierte und gespeicherte Spiele</h2><button id="refresh" class="button secondary" disabled>Aktualisieren</button></div><div id="apps" class="app-list"><div class="empty">Mit Administrator-Token verbinden.</div></div></section>\n<section class="panel" aria-labelledby="installHead"><h2 id="installHead">Spiel-ZIP installieren oder aktualisieren</h2><form id="installForm"><div class="form-grid"><label class="field">Spielkennung (muss zur API passen)<input id="appId" name="app_id" list="knownApps" pattern="[a-z][a-z0-9_-]{1,39}" required placeholder="yatzy, flip7 oder braendi-fifty" autocomplete="off"><datalist id="knownApps"><option value="yatzy"><option value="flip7"><option value="braendi-fifty"></datalist></label><label class="field">Anzeigename<input id="displayName" name="display_name" maxlength="80" placeholder="Yatzy Duell"></label></div><label class="field">Pages-ZIP aus deinen bestehenden Releases<input type="file" id="zip" name="zip" accept=".zip,application/zip" required></label><label class="check"><input type="checkbox" id="overwrite" name="overwrite" value="yes"> Bestehendes Frontend bewusst aktualisieren</label><label class="check"><input type="checkbox" id="lanPatch" name="lan_patch" value="yes" checked> LAN-Adapter anwenden (bei bekannten Yatzy-/Flip-7-Paketen dieselbe lokale Serveradresse verwenden; Brändi Fifty unterstützt dies bereits)</label><label class="check"><input type="checkbox" id="reactivate" name="reactivate" value="yes"> Zuvor vollständig gelöschtes Spiel ausdrücklich neu aktivieren</label><button type="submit" id="installButton" class="button primary">ZIP prüfen und installieren</button></form><p class="help">Es werden nur statische Dateien unter <code>/apps/spiel-id/</code> abgelegt. Kein Python- oder Node-Code aus dem ZIP wird ausgeführt. Vor jedem Update wird ein SQLite-Backup erstellt. Der Spiele-API-Token kann einmal oben als Gerätezugang hinterlegt werden und gilt dann für alle Spiele auf dieser Domain.</p></section>\n<section class="panel" aria-labelledby="backupHead"><div class="row-between"><h2 id="backupHead">SQLite-Sicherungen</h2><button id="newBackup" class="button primary" disabled>Jetzt sichern</button></div><p>Vor Datenlöschungen wird eine vollständige SQLite-Kopie erstellt. Lade regelmässig eine Kopie ausserhalb des Ubuntu-Servers herunter.</p><div id="backups" class="backup-list"><div class="empty">Noch keine Liste geladen.</div></div></section>\n</main><footer class="shell foot">Backup-Dateien enthalten weiterhin gelöschte Spielstände. Für eine vollständige Datenentfernung müssen alte Backups separat und bewusst nach deinen Aufbewahrungsregeln gelöscht werden.</footer><script src="/static/admin.js" defer></script></body></html>\n', 'site.css': ":root{color-scheme:light dark;--bg:#f2f6f7;--paper:#fff;--text:#193039;--muted:#586e76;--border:#d9e5e7;--accent:#147f85;--accent2:#0b6066;--bad:#bb3f3f;--line:#dbe4e8;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}\n@media(prefers-color-scheme:dark){:root{--bg:#0d171b;--paper:#18272b;--text:#e4f2f3;--muted:#b0c3c8;--border:#334b51;--accent:#51b9ba;--accent2:#3aa9a9;--bad:#ed8888;--line:#334b51}}\n*{box-sizing:border-box}html{background:var(--bg);-webkit-text-size-adjust:100%}body{margin:0;background:var(--bg);color:var(--text);min-height:100vh}a{color:var(--accent2)}button,input{font:inherit}input:not([type=checkbox]):not([type=file]){display:block;width:100%;margin-top:7px;padding:11px 12px;border:1px solid var(--border);border-radius:10px;background:var(--paper);color:var(--text)}input[type=file]{display:block;width:100%;margin-top:9px;color:var(--text)}.shell{width:min(930px,calc(100% - 32px));margin:auto}.top{background:var(--paper);border-bottom:1px solid var(--border);padding:18px 0}.row-between{display:flex;align-items:center;justify-content:space-between;gap:12px}.brand{display:flex;align-items:center;gap:11px}.brand strong{display:block;font-size:18px}.brand small{display:block;color:var(--muted);font-size:12px;margin-top:3px}.brand-mark{border-radius:12px;background:var(--accent);color:#fff;font-size:27px;min-width:46px;min-height:46px;display:grid;place-items:center}.subtle-link{font-size:14px;text-decoration:none;color:var(--muted);font-weight:650}.intro{padding:35px 0 28px}.intro h1{font-size:clamp(29px,5.2vw,46px);letter-spacing:-.035em;margin:10px 0}.intro p{max-width:650px;color:var(--muted);line-height:1.6}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.15em;color:var(--accent2);font-weight:750}.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(235px,1fr));gap:15px}.game-tile{background:var(--paper);border:1px solid var(--border);border-radius:18px;padding:20px;display:flex;align-items:center;gap:16px;text-decoration:none;color:var(--text);min-height:118px;box-shadow:0 8px 22px #00000005}.game-tile:hover,.game-tile:focus-visible{outline:2px solid var(--accent)}.game-icon{font-size:34px}.game-tile h2{font-size:18px;margin:0}.game-tile p{font-size:13px;color:var(--muted);margin:6px 0 0}.arrow{margin-left:auto;font-size:27px;color:var(--accent)}.empty{background:var(--paper);border:1px dashed var(--border);padding:25px;color:var(--muted);border-radius:14px;line-height:1.5;grid-column:1/-1}.hint{background:var(--paper);border:1px solid var(--border);border-radius:16px;margin-top:36px;padding:24px}.hint h2{margin:0 0 8px;font-size:18px}.hint p{margin:0;color:var(--muted);line-height:1.5}.foot{color:var(--muted);padding:32px 0 44px;font-size:13px;line-height:1.6}.admin{display:grid;gap:20px}.admin .intro{padding-bottom:2px}.panel{background:var(--paper);border:1px solid var(--border);border-radius:17px;padding:22px}.panel h2{font-size:20px;margin:0 0 16px}.field{font-weight:600;font-size:14px;display:block;margin-bottom:16px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.button{display:inline-flex;align-items:center;justify-content:center;padding:9px 13px;min-height:40px;border:1px solid transparent;border-radius:10px;cursor:pointer;text-decoration:none;font-weight:650;font-size:14px}.button.primary{background:var(--accent2);color:white}.button.secondary{border-color:var(--border);background:transparent;color:var(--text)}.button.danger{border-color:var(--bad);background:transparent;color:var(--bad)}.button:disabled{opacity:.45;cursor:default}.status{color:var(--muted);font-size:14px;margin-bottom:0;line-height:1.5}.status.error{color:var(--bad)}.small,.help{color:var(--muted);font-size:13px;line-height:1.5}.help{margin-top:18px}.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:15px}.notice{border-radius:14px;border:1px solid var(--border);padding:16px;line-height:1.5;font-size:14px}.notice.warning{border-color:#aa8153;background:color-mix(in srgb,var(--paper),#f3a31b 9%)}.check{display:flex;align-items:flex-start;gap:9px;font-size:14px;margin:15px 0;line-height:1.5}.check input{margin-top:4px;accent-color:var(--accent)}.app-list,.backup-list{display:grid;gap:12px}.app-row{padding:16px;border:1px solid var(--border);border-radius:12px}.app-row h3{margin:0 0 6px}.app-row p{margin:0}.pill{border-radius:20px;border:1px solid var(--border);font-size:12px;padding:5px 9px;color:var(--muted);white-space:nowrap}.pill.active{color:#177c5b}.pill.deleted{color:var(--bad)}.backup-row{display:flex;justify-content:space-between;align-items:center;gap:12px;border-bottom:1px solid var(--border);padding:12px 0;font-size:12px;word-break:break-word}code{font-size:12px;word-break:break-word}@media(max-width:600px){.top{padding:13px 0}.panel{padding:17px}.intro{padding:24px 0}.row-between{align-items:flex-start}.backup-row{flex-direction:column;align-items:flex-start}}\n", 'home.js': "'use strict';\nconst container=document.getElementById('apps');\nconst styles={yatzy:'🎲',flip7:'🃏','braendi-fifty':'🎯'};\nfetch('/api/apps',{cache:'no-store'}).then(async r=>{if(!r.ok)throw Error('HTTP '+r.status);return r.json()}).then(data=>{\n container.replaceChildren();\n const apps=data.apps||[];\n if(!apps.length){let p=document.createElement('div');p.className='empty';p.textContent='Noch keine Frontends installiert. Importiere Yatzy, Flip 7 oder Brändi Fifty über Verwaltung → Spiel-ZIP installieren.';container.append(p);return;}\n for(const app of apps){const a=document.createElement('a');a.className='game-tile';a.href=app.url;\n const icon=document.createElement('span');icon.className='game-icon';icon.textContent=styles[app.id]||'🎮';\n const label=document.createElement('div');const h=document.createElement('h2');h.textContent=app.name||app.id;\n const p=document.createElement('p');p.textContent='Spiel öffnen';label.append(h,p);\n const arrow=document.createElement('span');arrow.className='arrow';arrow.textContent='›';a.append(icon,label,arrow);container.append(a)}\n}).catch(error=>{container.textContent='Spiele konnten nicht geladen werden: '+error.message});\n", 'admin.js': "'use strict';\n// Admin token never enters localStorage, IndexedDB, cookies, URL or any backup.\n(()=>{\n let token='';const $=id=>document.getElementById(id);\n const localOrigin=location.origin;\n $('localOrigin').value=localOrigin;\n $('localApi').value=localOrigin;\n $('secureHint').textContent=location.protocol==='https:'?'HTTPS aktiv – geeignet für den lokalen PWA-Betrieb.':'HTTP aktiv – die Spiele funktionieren als Webseite; für zuverlässige installierte/offline PWAs auf iPhone lokales HTTPS verwenden.';\n $('copyOrigin').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(localOrigin);$('secureHint').textContent='Serveradresse kopiert: '+localOrigin}catch{prompt('Serveradresse kopieren:',localOrigin)}});\n const presets={'yatzy':'Yatzy Duell','flip7':'Flip 7','braendi-fifty':'Brändi Fifty – Punkteblock'};\n $('appId').addEventListener('change',()=>{const id=$('appId').value.trim();if(presets[id]&&!$('displayName').value.trim())$('displayName').value=presets[id]});\n function setStatus(msg,isError=false){$('status').textContent=msg;$('status').className='status'+(isError?' error':'');}\n async function deviceStatus(){\n  try{const r=await fetch('/api/device/status',{cache:'no-store',credentials:'same-origin'});const d=await r.json();\n   $('deviceStatus').textContent=d.authenticated?'Dieses Gerät ist für alle Spiele angemeldet.':'Dieses Gerät ist noch nicht für die Spiele-API angemeldet.';\n  }catch{$('deviceStatus').textContent='Gerätestatus konnte nicht geprüft werden.';}\n }\n async function deviceLogin(){\n  const supplied=$('deviceApiToken').value.trim();if(!supplied)throw Error('Spiele-API-Token fehlt');\n  const r=await fetch('/api/device/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:supplied}),cache:'no-store',credentials:'same-origin'});\n  $('deviceApiToken').value='';const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Geräteanmeldung fehlgeschlagen');await deviceStatus();\n }\n async function deviceLogout(){\n  const r=await fetch('/api/device/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store',credentials:'same-origin'});if(!r.ok)throw Error('Geräteabmeldung fehlgeschlagen');await deviceStatus();\n }\n async function call(path,opts={}){\n  const headers={'X-Admin-Token':token,...(opts.body instanceof FormData?{}:{'Content-Type':'application/json'})};\n  const response=await fetch('/admin/api'+path,{...opts,headers,cache:'no-store',credentials:'same-origin'});\n  const ct=response.headers.get('content-type')||'';\n  const data=ct.includes('json')?await response.json():{};\n  if(!response.ok)throw Error(data.error||'HTTP '+response.status);\n  return data;\n }\n function button(label,callback,style='secondary'){\n  const b=document.createElement('button');b.type='button';b.className='button '+style;b.textContent=label;b.addEventListener('click',callback);return b;\n }\n async function guarded(operation){try{await operation()}catch(error){setStatus(error.message,true);alert(error.message)}}\n async function refresh(){\n  const result=await call('/apps');$('apps').replaceChildren();\n  if(!result.apps.length){const e=document.createElement('div');e.className='empty';e.textContent='Keine Spiele registriert.';$('apps').append(e)}\n  for(const app of result.apps){\n   const card=document.createElement('article');card.className='app-row';\n   const head=document.createElement('div');head.className='row-between';\n   const title=document.createElement('div');const h=document.createElement('h3');h.textContent=app.display_name||app.app_id;\n   const detail=document.createElement('p');detail.className='small';detail.textContent=app.app_id+' · '+(app.frontend_installed?'Frontend installiert':'Kein Frontend')+' · '+(app.has_data?'Spieldaten vorhanden':'Keine Spieldaten')+' · Revision '+app.revision;\n   const pill=document.createElement('span');pill.className='pill '+app.state;pill.textContent=app.state==='active'?'Aktiv':app.state==='disabled'?'Deaktiviert':'Gelöscht';\n   title.append(h,detail);head.append(title,pill);card.append(head);\n   const actions=document.createElement('div');actions.className='actions';\n   if(app.frontend_installed&&app.state==='active'){\n    const link=document.createElement('a');link.href='/apps/'+encodeURIComponent(app.app_id)+'/';link.className='button secondary';link.textContent='Öffnen';actions.append(link);\n   }\n   if(app.state!=='deleted'){\n    actions.append(button(app.state==='disabled'?'Aktivieren':'Deaktivieren',()=>guarded(async()=>{\n     const next=app.state==='disabled'?'active':'disabled';\n     if(!confirm('Spiel '+app.app_id+' '+(next==='active'?'aktivieren':'deaktivieren')+'? Alte PWAs erhalten bei Deaktivierung HTTP 410.'))return;\n     await call('/apps/'+app.app_id+'/toggle',{method:'POST',body:JSON.stringify({state:next})});await refresh();\n    })));\n   }\n   if(app.frontend_installed){actions.append(button('Frontend-ZIP sichern',()=>guarded(async()=>{await download('/apps/'+encodeURIComponent(app.app_id)+'/download',app.app_id+'-frontend.zip')}),'secondary'));actions.append(button('Nur Frontend entfernen',()=>guarded(async()=>{\n    const phrase='ENTFERNEN '+app.app_id;\n    if(prompt('Frontend entfernen und Spieldaten behalten? Das Spiel wird deaktiviert.\\nZum Bestätigen eingeben: '+phrase)!==phrase)return;\n    const r=await call('/apps/'+app.app_id+'/uninstall',{method:'POST',body:JSON.stringify({confirm:phrase})});\n    setStatus('Frontend entfernt. Vollständiges SQLite-Backup: '+r.backup);await refresh();await loadBackups();\n   }),'secondary'))}\n   if(app.has_data||app.frontend_installed||app.state==='disabled'){\n    actions.append(button('Spiel und Daten löschen',()=>guarded(async()=>{\n     const phrase='LÖSCHEN '+app.app_id;\n     if(prompt('ACHTUNG: App-Dokument und Frontend werden entfernt, API dauerhaft gesperrt. Vorher SQLite-Backup.\\nZum Bestätigen eingeben: '+phrase)!==phrase)return;\n     if(!confirm('Wirklich die Daten von '+app.app_id+' löschen? Andere Spiele und gemeinsame Profile bleiben erhalten.'))return;\n     const r=await call('/apps/'+app.app_id+'/delete',{method:'POST',body:JSON.stringify({confirm:phrase})});\n     setStatus('Spiel gelöscht und gesperrt. Backup: '+r.backup);await refresh();await loadBackups();\n    }),'danger'))\n   }\n   card.append(actions);$('apps').append(card);\n  }\n }\n async function download(path,name){\n  const response=await fetch('/admin/api'+path,{headers:{'X-Admin-Token':token},cache:'no-store',credentials:'same-origin'});\n  if(!response.ok)throw Error('Download: HTTP '+response.status);\n  const blob=await response.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');\n  a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);\n }\n async function loadBackups(){\n  const result=await call('/backups');$('backups').replaceChildren();\n  if(!result.backups.length){$('backups').textContent='Noch keine Backups.';return}\n  for(const item of result.backups){\n   const row=document.createElement('div');row.className='backup-row';\n   const label=document.createElement('span');label.textContent=item.name+' · '+(item.sizeBytes/1024).toFixed(1)+' KB';\n   row.append(label,button('Herunterladen',()=>guarded(async()=>{\n    await download(item.kind==='frontend'?'/frontends/backups/'+encodeURIComponent(item.name):'/backups/'+encodeURIComponent(item.name),item.name);\n   })));\n   $('backups').append(row);\n  }\n }\n async function sharedRefresh(){\n   const x=await call('/shared');\n   $('sharedPlayers').replaceChildren();$('sharedAreas').replaceChildren();\n   for(const p of x.players){const e=document.createElement('p');e.textContent=p.name;$('sharedPlayers').append(e)}\n   for(const a of x.areas){const e=document.createElement('p');e.textContent=a.name+' · '+a.code;$('sharedAreas').append(e)}\n   if(!x.players.length)$('sharedPlayers').textContent='Noch keine gemeinsamen Spieler';\n   if(!x.areas.length)$('sharedAreas').textContent='Noch keine gemeinsamen Bereiche';\n }\n $('sharedAddPlayer').addEventListener('click',()=>guarded(async()=>{\n   const name=$('sharedPlayerName').value.trim();if(!name)throw Error('Spielername fehlt');\n   const value=await call('/shared/players',{method:'POST',body:JSON.stringify({name})});\n   $('sharedPlayerName').value='';$('sharedMessage').textContent=value.existing?'Spieler existiert bereits':'Spieler angelegt: '+value.name;await sharedRefresh();\n }));\n $('sharedAddArea').addEventListener('click',()=>guarded(async()=>{\n   const code=$('sharedAreaCode').value.trim();if(!code)throw Error('Bereichscode fehlt');\n   const value=await call('/shared/areas',{method:'POST',body:JSON.stringify({code})});\n   $('sharedAreaCode').value='';$('sharedMessage').textContent=value.existing?'Bereich existiert bereits':'Bereich angelegt: '+value.code;await sharedRefresh();\n }));\n $('sharedScan').addEventListener('click',()=>guarded(async()=>{\n   const x=await call('/shared/discover');const host=$('sharedCandidates');host.replaceChildren();\n   function group(title,items,key){\n     const h=document.createElement('h3');h.textContent=title;host.append(h);\n     for(const v of items){const label=document.createElement('label');label.className='check';const cb=document.createElement('input');cb.type='checkbox';cb.dataset.sharedType=key;cb.value=key==='player'?v.name:v.code;\n       const span=document.createElement('span');span.textContent=cb.value+' ('+v.sources.join(', ')+')';label.append(cb,span);host.append(label);}\n   }\n   group('Alte Spieler – Zuordnung zu derselben Person selbst prüfen',x.players,'player');\n   group('Alte Bereiche – nur Codes übernehmen',x.areas,'area');\n   $('sharedImport').disabled=!(x.players.length||x.areas.length);\n   $('sharedMessage').textContent='Nur ausgewählte Einträge werden in den Katalog eingetragen. Spielstände und alte Spieler-IDs werden nicht umgeschrieben.';\n }));\n $('sharedImport').addEventListener('click',()=>guarded(async()=>{\n   const selected=[...$('sharedCandidates').querySelectorAll('input:checked')];\n   const players=selected.filter(n=>n.dataset.sharedType==='player').map(n=>n.value);\n   const areas=selected.filter(n=>n.dataset.sharedType==='area').map(n=>n.value);\n   if(!(players.length||areas.length))throw Error('Keine Einträge ausgewählt');\n   if(!confirm(players.length+' Spieler und '+areas.length+' Bereiche in den gemeinsamen Katalog aufnehmen? Gleiche Namen werden im Katalog als dieselbe Person behandelt. Alte Spieldokumente bleiben unverändert.'))return;\n   const r=await call('/shared/import',{method:'POST',body:JSON.stringify({players,areas})});\n   $('sharedMessage').textContent='Katalog aktualisiert. '+r.links+' alte Profilzuordnungen verknüpft, '+r.link_conflicts.length+' Konflikte. SQLite-Sicherung: '+r.backup;\n   await sharedRefresh();await loadBackups();\n }));\n $('deviceLogin').addEventListener('click',()=>guarded(deviceLogin));\n $('deviceLogout').addEventListener('click',()=>guarded(deviceLogout));\n $('deviceRevokeAll').addEventListener('click',()=>guarded(async()=>{\n  if(!token)throw Error('Zuerst mit Administrator-Token verbinden');\n  if(!confirm('Wirklich alle Spiele-Geräte abmelden? Auf jedem Gerät muss der Spiele-API-Token danach einmal neu eingegeben werden.'))return;\n  const r=await call('/device/revoke-all',{method:'POST',body:'{}'});$('deviceStatus').textContent=r.revoked+' Gerätezugänge wurden widerrufen.';await loadBackups();\n }));\n deviceStatus();\n $('connect').addEventListener('click',()=>guarded(async()=>{\n  token=$('adminToken').value.trim();$('adminToken').value='';\n  if(!token)throw Error('Administrator-Token fehlt');\n  await refresh();await loadBackups();await sharedRefresh();$('refresh').disabled=false;$('newBackup').disabled=false;for(const id of ['sharedAddPlayer','sharedAddArea','sharedScan'])$(id).disabled=false;\n  $('deviceRevokeAll').disabled=false;setStatus('Angemeldet. Admin-Token ist nur in dieser geöffneten Seite im Arbeitsspeicher.');\n }));\n $('disconnect').addEventListener('click',()=>{$('deviceRevokeAll').disabled=true;for(const id of ['sharedAddPlayer','sharedAddArea','sharedScan','sharedImport'])$(id).disabled=true;$('sharedPlayers').textContent='';$('sharedAreas').textContent='';$('sharedCandidates').textContent='';token='';$('refresh').disabled=true;$('newBackup').disabled=true;setStatus('Getrennt. Browserseite neu laden, um die Sitzung zu verlassen.');$('apps').textContent='Nicht angemeldet.';$('backups').textContent='Nicht angemeldet.'});\n $('refresh').addEventListener('click',()=>guarded(async()=>{await refresh();await loadBackups();setStatus('Aktualisiert')}));\n $('newBackup').addEventListener('click',()=>guarded(async()=>{const r=await call('/backup',{method:'POST',body:'{}'});setStatus('SQLite-Sicherung: '+r.backup);await loadBackups()}));\n $('installForm').addEventListener('submit',e=>{e.preventDefault();guarded(async()=>{\n  if(!token)throw Error('Bitte zuerst Administrator-Token eingeben');\n  const appId=$('appId').value.trim(),file=$('zip').files[0];if(!file)throw Error('ZIP-Datei fehlt');\n  if(!confirm('Frontend-Paket '+file.name+' als '+appId+' installieren? Nur vertrauenswürdige Dateien verwenden.'))return;\n  const body=new FormData($('installForm'));\n  const r=await call('/apps/install',{method:'POST',body});\n  setStatus('Installiert: '+appId+' · DB-Backup '+r.backup+' · LAN-Anpassungen: '+(r.lan_adapter_changes||[]).join('; '));\n  await refresh();await loadBackups();\n })});\n})();\n"}
 STATIC_TYPES={".css":"text/css; charset=utf-8",".js":"application/javascript; charset=utf-8",".html":"text/html; charset=utf-8"}
 
-VERSION='v2.0.2'
+VERSION='2.2.0'
 AUTH=os.getenv('AUTH_ENABLED','true').lower() in ('true','1','yes')
 APP_TOKEN=os.getenv('APP_API_TOKEN','')
 ADMIN_TOKEN=os.getenv('ADMIN_TOKEN','')
@@ -468,6 +482,42 @@ def err(message,status=400,**extra):return jsonify(error=message,**extra),status
 
 def token_ok(received,actual):return bool(actual) and hmac.compare_digest(received or '',actual)
 
+DEVICE_COOKIE='spiele_device'
+DEVICE_SESSION_DAYS=max(1,min(730,int(os.getenv('DEVICE_SESSION_DAYS','180'))))
+
+def device_hash(raw):
+    return hashlib.sha256(('spiele-device-v1:'+str(raw)).encode('utf-8')).hexdigest()
+
+def device_cookie_secure():
+    forwarded=(request.headers.get('X-Forwarded-Proto','').split(',')[0].strip().lower())
+    return request.is_secure or forwarded=='https'
+
+def device_session_info():
+    raw=request.cookies.get(DEVICE_COOKIE,'')
+    if not raw:return None
+    now=int(time.time())
+    with connect() as c:
+        row=c.execute('SELECT token_hash,created_at,last_seen_at,expires_at FROM platform_device_sessions WHERE token_hash=?',(device_hash(raw),)).fetchone()
+        if not row:return None
+        if int(row['expires_at'])<=now:
+            c.execute('DELETE FROM platform_device_sessions WHERE token_hash=?',(row['token_hash'],))
+            return None
+        return dict(row)
+
+def device_session_ok():
+    return device_session_info() is not None
+
+def new_device_session():
+    raw=secrets.token_urlsafe(36);now=int(time.time());expires=now+DEVICE_SESSION_DAYS*86400;stamp=utc()
+    with connect() as c:
+        c.execute('DELETE FROM platform_device_sessions WHERE expires_at<=?',(now,))
+        c.execute('INSERT INTO platform_device_sessions(token_hash,created_at,last_seen_at,expires_at) VALUES(?,?,?,?)',(device_hash(raw),stamp,stamp,expires))
+    return raw,expires
+
+def clear_device_session(raw):
+    if not raw:return
+    with connect() as c:c.execute('DELETE FROM platform_device_sessions WHERE token_hash=?',(device_hash(raw),))
+
 def same_origin():
     origin=request.headers.get('Origin','')
     if not origin:return True # Non-browser clients must still supply the auth token
@@ -483,9 +533,11 @@ def access():
     if request.path.startswith('/admin/api/'):
         if not token_ok(request.headers.get('X-Admin-Token',''),ADMIN_TOKEN):return err('Admin-Token fehlt oder ungültig',401)
         if request.method not in ('GET','HEAD') and not same_origin():return err('Admin-Aktion nur von gleicher Origin',403)
-    if request.path.startswith('/api/') and request.path not in ('/api/health','/api/config','/api/apps'):
+    public_api={'/api/health','/api/config','/api/apps','/api/device/login','/api/device/status','/api/device/logout'}
+    if request.path.startswith('/api/') and request.path not in public_api:
         auth=request.headers.get('Authorization','')
-        if AUTH and (not auth.startswith('Bearer ') or not token_ok(auth[7:],APP_TOKEN)):
+        bearer_ok=auth.startswith('Bearer ') and token_ok(auth[7:],APP_TOKEN)
+        if AUTH and not (bearer_ok or device_session_ok()):
             return err('Unauthorized',401)
     if request.path.startswith('/api/v1/apps/'):
         parts=request.path.split('/')
@@ -523,7 +575,31 @@ def page_not_found(e):return err('Nicht gefunden',404) if request.path.startswit
 def health():return jsonify(status='ok',version=VERSION,schema=1)
 
 @app.get('/api/config')
-def config():return jsonify(version=VERSION,service='Spiele-Zentrale',auth_enabled=AUTH,storage='server',api='v1',maxAppDocumentBytes=MAX_DOC)
+def config():return jsonify(version=VERSION,service='Spiele-Zentrale',auth_enabled=AUTH,storage='server',api='v1',sameOriginFrontends=True,frontendBase='/apps/',maxAppDocumentBytes=MAX_DOC,deviceAuth=True,deviceSessionDays=DEVICE_SESSION_DAYS)
+
+@app.get('/api/device/status')
+def device_status():
+    info=device_session_info()
+    return jsonify(authenticated=bool(info),expiresAt=info['expires_at'] if info else None,authEnabled=AUTH)
+
+@app.post('/api/device/login')
+def device_login():
+    if not same_origin():return err('Geräteanmeldung nur von gleicher Origin',403)
+    body=request.get_json(silent=True) or {}
+    supplied=str(body.get('token') or '')
+    if AUTH and not token_ok(supplied,APP_TOKEN):return err('Spiele-API-Token ungültig',401)
+    raw,expires=new_device_session()
+    response=jsonify(authenticated=True,expiresAt=expires)
+    response.set_cookie(DEVICE_COOKIE,raw,max_age=DEVICE_SESSION_DAYS*86400,httponly=True,secure=device_cookie_secure(),samesite='Lax',path='/')
+    return response
+
+@app.post('/api/device/logout')
+def device_logout():
+    if not same_origin():return err('Geräteabmeldung nur von gleicher Origin',403)
+    clear_device_session(request.cookies.get(DEVICE_COOKIE,''))
+    response=jsonify(authenticated=False)
+    response.delete_cookie(DEVICE_COOKIE,path='/',secure=device_cookie_secure(),samesite='Lax')
+    return response
 
 @app.get('/api/apps')
 def installed_list():
@@ -594,6 +670,186 @@ def restore_snapshot(app_id):
         audit(c,'snapshot_restored',app_id,sid)
     return jsonify(status='ok',revision=next_rev)
 
+
+# Cross-game catalogue. Only catalog rows are written; game documents and IDs are never migrated silently.
+SHARED_CODE = re.compile(r'^[A-Za-z0-9_-]{3,40}$')
+RESERVED_CODES = {'__proto__','constructor','prototype'}
+
+def shared_name(value):
+    if not isinstance(value,str):raise ValueError('Name muss Text sein')
+    name=' '.join(value.strip().split())
+    if not name or len(name)>48:raise ValueError('Name: 1–48 Zeichen')
+    return name
+
+def shared_code(value):
+    if not isinstance(value,str) or not SHARED_CODE.fullmatch(value) or value.lower() in RESERVED_CODES:
+        raise ValueError('Bereichscode: 3–40 Zeichen, Buchstaben, Zahlen, _ oder -')
+    return value
+
+def shared_catalog(c):
+    players=[{'id':r['id'],'name':r['name']} for r in c.execute('SELECT id,name FROM platform_shared_players ORDER BY name_key')]
+    areas=[{'code':r['code'],'name':r['name']} for r in c.execute('SELECT code,name FROM platform_shared_areas ORDER BY code_key')]
+    links=[{'app_id':r['app_id'],'area_code':r['area_code'],'local_id':r['local_id'],'shared_id':r['shared_id']}
+        for r in c.execute('SELECT app_id,area_code,local_id,shared_id FROM platform_shared_player_links')]
+    return {'version':1,'players':players,'areas':areas,'links':links}
+
+def shared_add_player(c,name):
+    name=shared_name(name)
+    key=name.casefold()
+    existing=c.execute('SELECT id,name FROM platform_shared_players WHERE name_key=?',(key,)).fetchone()
+    if existing:return {'id':existing['id'],'name':existing['name'],'existing':True}
+    pid=str(uuid.uuid4()); stamp=utc()
+    c.execute('INSERT INTO platform_shared_players VALUES(?,?,?,?,?)',(pid,name,key,stamp,stamp))
+    return {'id':pid,'name':name,'existing':False}
+
+def shared_add_area(c,code,name=None):
+    code=shared_code(code)
+    key=code.casefold()
+    existing=c.execute('SELECT code,name FROM platform_shared_areas WHERE code_key=?',(key,)).fetchone()
+    if existing:return {'code':existing['code'],'name':existing['name'],'existing':True}
+    title=shared_name(name if name else code)
+    stamp=utc()
+    c.execute('INSERT INTO platform_shared_areas VALUES(?,?,?,?,?)',(code,key,title,stamp,stamp))
+    return {'code':code,'name':title,'existing':False}
+
+@app.get('/api/v1/shared')
+def shared_get():
+    with connect() as c:return jsonify(**shared_catalog(c))
+
+@app.post('/api/v1/shared/players')
+def shared_player_create():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):return err('JSON mit Name erwartet')
+    try:
+        with transaction() as c:
+            value=shared_add_player(c,body.get('name'))
+            audit(c,'shared_player_created',detail=value['id'])
+    except ValueError as e:return err(str(e))
+    return jsonify(**value),200 if value['existing'] else 201
+
+@app.post('/api/v1/shared/areas')
+def shared_area_create():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):return err('JSON mit Bereichscode erwartet')
+    try:
+        with transaction() as c:
+            value=shared_add_area(c,body.get('code'),body.get('name'))
+            audit(c,'shared_area_created',detail=value['code'])
+    except ValueError as e:return err(str(e))
+    return jsonify(**value),200 if value['existing'] else 201
+
+@app.patch('/api/v1/shared/players/<player_id>')
+def shared_player_rename(player_id):
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):return err('JSON mit Name erwartet')
+    try:
+        name=shared_name(body.get('name'))
+        with transaction() as c:
+            if not c.execute('SELECT 1 FROM platform_shared_players WHERE id=?',(player_id,)).fetchone():return err('Spieler nicht gefunden',404)
+            match=c.execute('SELECT id FROM platform_shared_players WHERE name_key=?',(name.casefold(),)).fetchone()
+            if match and match['id']!=player_id:return err('Name wird bereits verwendet',409)
+            c.execute('UPDATE platform_shared_players SET name=?,name_key=?,updated_at=? WHERE id=?',(name,name.casefold(),utc(),player_id))
+            audit(c,'shared_player_renamed',detail=player_id)
+    except ValueError as e:return err(str(e))
+    return jsonify(id=player_id,name=name)
+
+def discover_shared(c):
+    # Read-only inventory. No guesswork about whether identical names are identical persons.
+    found_players={}; found_areas={}
+    def person(name,source,app_id='',area_code='',local_id=''):
+        if not isinstance(name,str) or not name.strip() or len(name.strip())>48:return
+        clean=' '.join(name.strip().split());key=clean.casefold()
+        item=found_players.setdefault(key,{'name':clean,'sources':[],'identities':[]})
+        if source not in item['sources']:item['sources'].append(source)
+        if app_id and isinstance(local_id,str) and local_id and len(local_id)<=100:
+            link={'app_id':app_id,'area_code':area_code,'local_id':local_id}
+            if link not in item['identities']:item['identities'].append(link)
+    def area(code,source):
+        if not isinstance(code,str) or not SHARED_CODE.fullmatch(code) or code.lower() in RESERVED_CODES:return
+        item=found_areas.setdefault(code.casefold(),{'code':code,'sources':[]})
+        if source not in item['sources']:item['sources'].append(source)
+    try:
+        for p in all_players(c):person(p.get('name'),'bestehende Spielertabelle')
+    except RuntimeError:
+        pass  # Unknown legacy schema must not block safe discovery from game documents.
+    for game_id in ('yatzy','flip7','braendi-fifty'):
+        try:doc=get_doc(c,game_id)['data']
+        except (RuntimeError,ValueError):continue
+        if not isinstance(doc,dict):continue
+        # Yatzy also keeps an independent central registry of player names.
+        if game_id=='yatzy' and isinstance(doc.get('registryProfiles'),list):
+            for p in doc['registryProfiles']:
+                if isinstance(p,dict):person(p.get('name'),'yatzy / Profilregister')
+        areas=doc.get('areas')
+        if isinstance(areas,dict):
+            for code,content in areas.items():
+                area(code,game_id)
+                if isinstance(content,dict) and isinstance(content.get('profiles'),list):
+                    for p in content['profiles']:
+                        if isinstance(p,dict):person(p.get('name'),game_id+' / '+code,game_id,code,str(p.get('id') or ''))
+        elif game_id=='flip7' and isinstance(doc.get('profiles'),list):
+            for p in doc['profiles']:
+                if isinstance(p,dict):person(p.get('name'),'flip7',game_id,'',str(p.get('id') or ''))
+    return {'players':sorted(found_players.values(),key=lambda x:x['name'].casefold()),
+            'areas':sorted(found_areas.values(),key=lambda x:x['code'].casefold())}
+
+@app.get('/admin/api/shared')
+def admin_shared():
+    with connect() as c:return jsonify(**shared_catalog(c))
+
+@app.get('/admin/api/shared/discover')
+def admin_shared_discover():
+    with connect() as c:return jsonify(**discover_shared(c))
+
+@app.post('/admin/api/shared/import')
+def admin_shared_import():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict) or not isinstance(body.get('players'),list) or not isinstance(body.get('areas'),list):
+        return err('Listen players und areas erforderlich')
+    if len(body['players'])>250 or len(body['areas'])>200:return err('Zu viele Einträge')
+    try:
+        pnames=[shared_name(v) for v in body['players']]
+        codes=[shared_code(v) for v in body['areas']]
+    except ValueError as e:return err(str(e))
+    backup=str(full_backup('before-shared-catalog-import').name)
+    # Catalog adoption never updates app_documents. Linking only labels legacy IDs.
+    with transaction() as c:
+        discovery=discover_shared(c)
+        discovered={p['name'].casefold():p for p in discovery['players']}
+        result={'players':[],'areas':[],'links':0,'link_conflicts':[],'backup':backup}
+        for name in pnames:
+            value=shared_add_player(c,name);result['players'].append(value)
+            for item in discovered.get(name.casefold(),{}).get('identities',[]):
+                key=(item['app_id'],item['area_code'],item['local_id'])
+                existing=c.execute('SELECT shared_id FROM platform_shared_player_links WHERE app_id=? AND area_code=? AND local_id=?',key).fetchone()
+                if existing:
+                    if existing['shared_id']!=value['id']:result['link_conflicts'].append(dict(item))
+                    continue
+                c.execute('INSERT INTO platform_shared_player_links VALUES(?,?,?,?,?)',(*key,value['id'],utc()))
+                result['links']+=1
+        result['areas']=[shared_add_area(c,v) for v in codes]
+        audit(c,'shared_catalog_imported',detail=f'{len(pnames)} players; {len(codes)} areas; {result["links"]} links')
+    return jsonify(**result)
+
+
+@app.post('/admin/api/shared/players')
+def admin_shared_player_add():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):return err('JSON mit Name erwartet')
+    try:
+        with transaction() as c:result=shared_add_player(c,body.get('name'))
+    except ValueError as e:return err(str(e))
+    return jsonify(**result),200 if result['existing'] else 201
+
+@app.post('/admin/api/shared/areas')
+def admin_shared_area_add():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict):return err('JSON mit Code erwartet')
+    try:
+        with transaction() as c:result=shared_add_area(c,body.get('code'))
+    except ValueError as e:return err(str(e))
+    return jsonify(**result),200 if result['existing'] else 201
+
 # Generic players API (existing shared-profile tables remain untouched).
 @app.get('/api/v1/players')
 def players_list():
@@ -612,6 +868,23 @@ def players_add():
         try:add_player(c,identifier,name)
         except sqlite3.IntegrityError:return err('Spieler-ID existiert bereits',409)
     return jsonify(id=identifier,name=name),201
+
+@app.get('/admin/api/device/sessions')
+def admin_device_sessions():
+    now=int(time.time())
+    with connect() as c:
+        c.execute('DELETE FROM platform_device_sessions WHERE expires_at<=?',(now,))
+        count=c.execute('SELECT COUNT(*) AS n FROM platform_device_sessions').fetchone()['n']
+    return jsonify(active=count,sessionDays=DEVICE_SESSION_DAYS)
+
+@app.post('/admin/api/device/revoke-all')
+def admin_device_revoke_all():
+    backup=full_backup('before-device-revoke')
+    with connect() as c:
+        count=c.execute('SELECT COUNT(*) AS n FROM platform_device_sessions').fetchone()['n']
+        c.execute('DELETE FROM platform_device_sessions')
+        audit(c,'device_sessions_revoked',detail=str(count))
+    return jsonify(revoked=count,backup=backup.name)
 
 @app.get('/')
 def home():return Response(STATIC_ASSETS['index.html'],mimetype='text/html')
