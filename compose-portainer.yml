@@ -17,7 +17,6 @@ services:
       AUTH_ENABLED: "true"
       APP_API_TOKEN: "${SPIELE_API_TOKEN:?SPIELE_API_TOKEN fehlt}"
       ADMIN_TOKEN: "${SPIELE_ADMIN_TOKEN:?SPIELE_ADMIN_TOKEN fehlt}"
-      PWA_ALLOWED_ORIGIN: "https://ashguard85.github.io"
       BACKUP_KEEP: "50"
       MAX_APP_DOC_BYTES: "20000000"
       MAX_FRONTEND_ZIP_MB: "30"
