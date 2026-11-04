@@ -1,4 +1,4 @@
-# Spiele-Zentrale 2.4.0 – bereinigter Endstand
+# Spiele-Zentrale 2.4.1 – bereinigter Endstand
 
 Für den Betrieb nach der Migration: lokale URL oder `https://play.haasenheim.com`, Frontends unter `/apps/<id>/`, API und Admin auf derselben Origin.
 
@@ -23,3 +23,11 @@ Die Kompatibilitätsadapter sollten nicht entfernt werden, solange dieselbe migr
 
 
 Neu in v2.4.0: frei sortierbare Startseite und zentral verwaltete PNG/JPG/WebP-Spielicons, die Startseite und Punkteblöcke gemeinsam verwenden.
+
+
+## Fix in v2.4.1
+
+- Zentral hochgeladene Spielicons erhalten eine versionsabhängige URL.
+- Beim Ersetzen eines Icons können Browser oder Cloudflare dadurch nicht mehr das alte Bild unter derselben URL weiterverwenden.
+- Der Icon-Endpunkt liefert zusätzlich strikte No-Cache-Header.
+- Kein Frontend-Update erforderlich; bestehende Apps übernehmen die neue `iconUrl` automatisch über `/api/apps`.

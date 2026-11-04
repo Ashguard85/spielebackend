@@ -1,4 +1,4 @@
-"""Spiele-Zentrale v2.4.0 – same-origin local/Cloudflare build for Portainer.
+"""Spiele-Zentrale v2.4.1 – same-origin local/Cloudflare build for Portainer.
 
 All platform code and admin assets are intentionally kept in app.py so Docker's
 remote Git build only requires root-level files. Existing game data remains in
@@ -291,7 +291,13 @@ def icon_url_for(info):
     mime=info.get('icon_mime') if isinstance(info,dict) else info['icon_mime']
     app_id=info.get('app_id') if isinstance(info,dict) else info['app_id']
     path=icon_file(app_id,mime) if mime else None
-    return '/media/apps/'+app_id+'/icon' if path and path.is_file() else None
+    if not path or not path.is_file():
+        return None
+    # Replacing an icon must also change its URL so browser/Cloudflare caches
+    # cannot keep serving the previous bytes under the same address.
+    st=path.stat()
+    version=f'{st.st_mtime_ns:x}-{st.st_size:x}'
+    return '/media/apps/'+app_id+'/icon?v='+version
 
 def remove_icon(app_id):
     for ext in ICON_EXT.values():
@@ -919,7 +925,11 @@ def app_icon(app_id):
     if not item or not item.get('icon_mime'):abort(404)
     path=icon_file(app_id,item['icon_mime'])
     if not path or not path.is_file():abort(404)
-    return send_file(path,mimetype=item['icon_mime'],conditional=True,max_age=0)
+    response=send_file(path,mimetype=item['icon_mime'],conditional=False,max_age=0)
+    response.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma']='no-cache'
+    response.headers['Expires']='0'
+    return response
 
 @app.get('/apps/<app_id>')
 def game_redirect(app_id):return redirect('/apps/'+app_id+'/',code=308)
@@ -1017,7 +1027,7 @@ def admin_app_icon_upload(app_id):
     with transaction() as c:
         c.execute('UPDATE platform_registry SET icon_mime=?,icon_updated_at=?,updated_at=? WHERE app_id=?',(mime,utc(),utc(),app_id))
         audit(c,'app_icon_updated',app_id,mime)
-    return jsonify(status='ok',iconUrl='/media/apps/'+app_id+'/icon')
+    return jsonify(status='ok',iconUrl=icon_url_for({'app_id':app_id,'icon_mime':mime}))
 
 @app.delete('/admin/api/apps/<app_id>/icon')
 def admin_app_icon_delete(app_id):
