@@ -1,4 +1,4 @@
-# Spiele-Zentrale 2.3.0 – Endzustand nach Migration
+# Spiele-Zentrale 2.4.0 – Endzustand nach Migration
 
 Die Plattform erwartet Frontend und API auf derselben Origin, z. B. lokal `http://SERVER:8110` oder extern `https://play.haasenheim.com`.
 

@@ -1,4 +1,4 @@
-# Spiele-Zentrale 2.3.0 – bereinigter Endstand
+# Spiele-Zentrale 2.4.0 – bereinigter Endstand
 
 Für den Betrieb nach der Migration: lokale URL oder `https://play.haasenheim.com`, Frontends unter `/apps/<id>/`, API und Admin auf derselben Origin.
 
@@ -20,3 +20,6 @@ Für den Betrieb nach der Migration: lokale URL oder `https://play.haasenheim.co
 - Frontend-Hosting und Admin-Installation.
 
 Die Kompatibilitätsadapter sollten nicht entfernt werden, solange dieselbe migrierte SQLite-Datenbank weiterverwendet wird. Sie erzeugen keinen externen Sync und kontaktieren keinen alten Server.
+
+
+Neu in v2.4.0: frei sortierbare Startseite und zentral verwaltete PNG/JPG/WebP-Spielicons, die Startseite und Punkteblöcke gemeinsam verwenden.
