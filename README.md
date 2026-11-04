@@ -31,3 +31,11 @@ Neu in v2.4.0: frei sortierbare Startseite und zentral verwaltete PNG/JPG/WebP-S
 - Beim Ersetzen eines Icons können Browser oder Cloudflare dadurch nicht mehr das alte Bild unter derselben URL weiterverwenden.
 - Der Icon-Endpunkt liefert zusätzlich strikte No-Cache-Header.
 - Kein Frontend-Update erforderlich; bestehende Apps übernehmen die neue `iconUrl` automatisch über `/api/apps`.
+
+
+## Backup-Aufbewahrung
+
+- `BACKUP_KEEP` begrenzt ausschliesslich die internen `platform_app_backups`-Snapshots pro App. Die Bereinigung passiert beim nächsten erfolgreichen Speichern der jeweiligen App.
+- Vollständige SQLite-Dateien unter `DATA_DIR/backups/*.sqlite` werden nicht automatisch gelöscht.
+- Frontend-Sicherungen unter `DATA_DIR/backups/frontends/*.zip` werden ebenfalls nicht automatisch gelöscht.
+- Ab v2.4.2 können beide Backup-Typen im Adminbereich einzeln heruntergeladen und nach Bestätigung gelöscht werden.
