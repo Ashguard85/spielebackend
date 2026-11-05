@@ -21,6 +21,8 @@ services:
       MAX_APP_DOC_BYTES: "20000000"
       MAX_FRONTEND_ZIP_MB: "30"
       DEVICE_SESSION_DAYS: "180"
+      PREVIEW_KEEP_HOURS: "24"
+      PREVIEW_MAX: "10"
       REQUIRE_EXISTING_DB: "1"
 
     healthcheck:

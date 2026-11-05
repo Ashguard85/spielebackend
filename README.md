@@ -39,3 +39,8 @@ Neu in v2.4.0: frei sortierbare Startseite und zentral verwaltete PNG/JPG/WebP-S
 - Vollständige SQLite-Dateien unter `DATA_DIR/backups/*.sqlite` werden nicht automatisch gelöscht.
 - Frontend-Sicherungen unter `DATA_DIR/backups/frontends/*.zip` werden ebenfalls nicht automatisch gelöscht.
 - Ab v2.4.2 können beide Backup-Typen im Adminbereich einzeln heruntergeladen und nach Bestätigung gelöscht werden.
+
+
+## v2.5.0 – ZIP-Vorschau / Debug
+
+Im Adminbereich können Frontend-ZIPs temporär geprüft werden, ohne sie zu installieren. Vorschauen laufen unter `/apps/preview-<id>/` mit eigener Test-API, eigenem Browser-Datenpräfix und ohne Service Worker. Produktive App-Dokumente werden nicht verändert. Standard-Aufbewahrung: 24 Stunden (`PREVIEW_KEEP_HOURS`), maximal 10 Vorschauen (`PREVIEW_MAX`).
